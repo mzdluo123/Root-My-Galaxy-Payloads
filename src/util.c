@@ -865,6 +865,16 @@ uintptr_t prepare_kernel_page(int payload_mode) {
 
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, reclaim_sv));
   int sndbuf = 1 << 20;
+  const char *sndbuf_env = getenv("SKB_SNDBUF");
+  if (sndbuf_env && *sndbuf_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(sndbuf_env, &end, 0);
+    if (!errno && end != sndbuf_env && !*end && value >= (1 << 16) &&
+        value <= (64 << 20)) {
+      sndbuf = (int)value;
+    }
+  }
   setsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
   int reclaim_flags = fcntl(reclaim_sv[0], F_GETFL, 0);
   if (reclaim_flags >= 0) {

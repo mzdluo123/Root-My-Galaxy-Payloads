@@ -63,7 +63,14 @@
 #define P0_ORACLE_PROBE_SLOT 1
 #define P0_ORACLE_GATE_RESTORE_SLOT 2
 #define P0_ORACLE_PROBE_RESTORE_SLOT 3
-#define P0_ORACLE_GATE_PAGE_OFF 0x0e80
+/* The gate marker must land inside the first order-3 skb fragment.  With
+ * SKB_DATA_DELTA=-0x1000 the fragment carries payload indices
+ * [0x1000, 0x9000): index I maps to (base - 0x1000) + I.  The pipe
+ * read-back shows page 0 of the fragment = payload indices
+ * [0x1000, 0x2000), so the marker must sit in that range.  The previous
+ * 0x0e80 landed at base - 0x180 (skb head territory), which is why the
+ * gate could never flip.  0x1e80 keeps the intended "0xe80 into page 0". */
+#define P0_ORACLE_GATE_PAGE_OFF 0x1e80
 #define P0_ORACLE_GATE_OBJECT_INDEX 1
 #define P0_ORACLE_PROBE_OFFSET 0x1f0000ULL
 #define P0_FINGERPRINT_HEADER \
