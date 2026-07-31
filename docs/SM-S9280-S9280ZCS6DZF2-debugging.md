@@ -536,6 +536,108 @@ armed-node layout (`src/slide_app.c:162-234`, `prepare_slide_pselect_fdsets`).
 3. After any further panic: `adb pull /data/log/prev_dump.log` FIRST (it
    rotates each boot), then check `power_off_reset_reason.txt` tail.
 
+### Walk disassembly (vmlinux.elf, exact crash-site mapping)
+
+`rt_mutex_adjust_prio_chain` @ `0xffffffc00912271c` (size 0x91c),
+`_raw_spin_trylock` @ `0xffffffc0091244ac` (0xa4).
+
+- Struct offsets confirmed: `task->pi_lock` = +0x924, `task->pi_blocked_on`
+  = +0x950, `task->prio` = +0x84; `waiter->lock` = +0x38, `waiter->prio` =
+  +0x44; LEGACY `rt_mutex_waiter` (tree_entry @0, pi_tree_entry @0x18).
+- `+0x124..+0x130`: `x24 = waiter->lock; bl _raw_spin_trylock` — the very
+  first lock op of the walk. **All 17 `_raw_spin_trylock+0x1c` panics are
+  this site with `waiter->lock == 0`** (KP #39 full regs: x0=0, x24=0,
+  x25=0xffffffc0561bbc38 = stale waiter on the waiter thread's kernel
+  stack, panicking thread = our own consumer inside `sched_setattr`).
+  The reset-reason log's "garbage LR" (`0xXX4009XX284c`) is just
+  nibble-scrambled `rt_mutex_adjust_prio_chain+0x130` = `...091228 4c`.
+- `+0x1ec`: `ldr x8, [x27, #0x38]` with `x27 = lock->waiters.rb_node` —
+  crashes when the waiters tree root is garbage (dead-frame shots).
+- `+0x134..+0x150`: trylock-fail retry loop (unlock pi_lock, yield, relock,
+  re-read `pi_blocked_on`).
+- `+0x220`: `rb_erase(waiter->tree_entry, lock->waiters)` = the write.
+- `+0x858`: sanity BUG when top waiter's lock != current lock.
+
+### Futex-side stack geometry re-verified on S9280
+
+Chain: `__arm64_sys_futex` (sub sp,#0x70) -> `do_futex` (#0x60) ->
+`futex_wait_requeue_pi` (#0x1b0). `rt_mutex_init_waiter`'s
+`RB_CLEAR_NODE` self-stores place `rt_waiter` at `sp+0x98` =
+`E - 0xd0 - 0x1b0 + 0x98` = **E - 0x1e8**, exactly the S928U-derived value
+the doc assumed; waiter->lock at `E-0x1e8+0x38` = stack_fds+0x50 = ex word
+0 = shift+7. **SLIDE_PSELECT_WORD_SHIFT=3 is now confirmed on BOTH the
+pselect and the futex side of the S9280 kernel.**
+
+### Dead-frame shots were the dominant panic source (fixed)
+
+Milestone timestamps (waiter vs consumer, µs from WAIT_REQUEUE_PI entry):
+timeout return t≈50.1ms, unlock done +0.6ms, pselect arming +0.8ms — the
+waiter arms fast. But consumer burst shots slip badly under load: with
+ENTER_DELAY=60ms + spacing=15ms, idx=0 lands at 61ms after arming (inside
+the 100 ms window) yet idx=1 landed **354 ms** later (idx=0's
+`sched_setattr` itself blocks in-kernel for tens-to-hundreds of ms —
+migration/stopper noise or the walk's retry loop on the owner-held
+f_pi_target lock; the owner thread never unlocks f_pi_target during the
+attempt). Shots after window expiry walk a dead/reused stack frame →
+`waiter->lock` reads 0 (cleanup zeroed) or garbage → the 17× trylock(0)
+and 4× mid-walk panics.
+
+**Fix (fix #17)**: `slide_pselect_armed` flag set around the pselect6
+call; the consumer burst re-checks it before every shot and aborts late
+shots. New env knob `SLIDE_PSELECT_TIMEOUT_MS` widens the armed window at
+runtime. Result: **first fully panic-free runs** (3/3 and 6/6 attempts, no
+reboots). Milestone logging stays in the debug build.
+
+### Refined failure model (2026-07-31, supersedes "post-exit UAF")
+
+1. Trigger = consumer `sched_setattr` walk via the waiter's dangling
+   `pi_blocked_on` residue (EDEADLK + 50 ms timeout). Residue survives in
+   only ~1/10 attempts (fix #16 conclusion stands) — the real bottleneck.
+2. Arming geometry is correct (shift=3 verified both sides); when the
+   residue exists and a shot lands in-window, the erase fires with our
+   armed values.
+3. The erase's write goes to `parent` = struct page of `page_base` and
+   `target` = pipe_buffer area. If the skb reclaim missed, `page_base`'s
+   page is either idle/buddy (**silent corruption, no gate, no panic** —
+   the common case) or live on an LRU (HeapTaskDaemon anon page →
+   `__list_del_entry_valid` BUG, the 3 bystander panics). KP #37's
+   corruption (physmap VA written into vmemmap `page->lru.next`) matches
+   `parent->rb_right = target` with parent = struct page of a live page.
+4. All synchronous in-walk panics (trylock(0), mid-walk derefs) were
+   dead-frame shots, eliminated by fix #17.
+
+So: gate hits=0 has three independent causes — residue absent (~90%),
+reclaim miss (page_base not ours), or write landing on an idle page
+(silent). The pipe gate cannot tell them apart; distinguishing residue
+vs reclaim is the next diagnostic step.
+
+### Volume run + current status (2026-07-31, end of session)
+
+- 30-attempt volume run (burst=1, ENTER_DELAY=60ms, 100 ms window, armed
+  gate): **attempt 1 fired** (`pselect ret=2 elapsed=100166`, copyback
+  `in word=3=0x1` / `ex word=1=0x100000000` — the classic fire signature)
+  and the device panicked immediately after. Notably this shot returned
+  `sched_ok=0 last_sched_ret=-1` (sched_setattr itself failed — first
+  observed; previous clean fires had sched_ok>0). Fires remain
+  intermittent (~1/10 attempts across today's samples) and a fire still
+  kills the device, because the write lands wherever `page_base`'s page
+  happens to be (reclaim unverified) — the armed gate only eliminated the
+  dead-frame crash class, not the bystander class.
+- Net blocker ranking: (1) reclaim/placement verification — a completed
+  erase has never landed on the oracle pipe; (2) residue rate ~1/10.
+  Both must be solved for a clean root run.
+- Open anomaly: `sched_setattr` duration of 39-340 ms inside the kernel
+  on firing shots (retry loop vs migration noise — unresolved).
+- Next steps on resume: (a) make the residue/reclaim distinction
+  measurable (e.g. point `slide_oracle_parent` at the pipebuf page itself
+  so any completed erase flips gate `changed` without needing the payload
+  reclaim); (b) if reclaim is the miss, rework the cross-cache placement
+  (order-3 frag vs freed pipe page); (c) only then run the real root
+  chain without `P0_ORACLE_GATE_DIAG`.
+- Note: after the volume-run panic the device stopped enumerating on adb
+  (still absent after `adb kill-server`; check the phone physically —
+  it may be in a boot loop or powered off).
+
 ## Files Modified
 
 All S9280-related changes are uncommitted working-tree changes (the

