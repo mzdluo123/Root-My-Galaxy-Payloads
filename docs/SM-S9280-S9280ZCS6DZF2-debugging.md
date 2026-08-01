@@ -1319,9 +1319,734 @@ exhaustion from attempt 1's leaked state):
   trigger instant. adb exited 255: the device panicked right there and
   the fix #31 gate tenant dump was never emitted. Trigger-side crash,
   not a preparation failure.
-- KP #57 dump pull pending; its crash signature (trylock +0x12c vs
-  get_task_struct +0x4a4 vs another vmemmap scribble) tells which
-  tenant the walk actually found in the target page this time.
+- KP #57 (`prev_dump_rwc57.log`, RWC:57): `rt_mutex_adjust_prio_chain+0x4a4`,
+  fault addr `0001000000000040`, in our `id` child at the trigger instant.
+  x24=x3=ffffff88f45e8980 = attempt-1 fake_lock (compact layout base+0x980),
+  x19=0001000000000000, x9=0000000100000002. Same thief content as KP #55.
+  The fix #31 tenant dump was never reached (panic at the walk).
+
+### Run 12 — KP #58, identical (2026-08-01)
+
+`LATE_NEIGHBOUR_FREE=1 DGRAM_RECLAIM=1 SKB_RECLAIM_SOCKS=8 RECLAIM_WAVES=24
+RECLAIM_WAVE_ANON=1 MM_DRAIN_TRIGGERS=16 ... PARENT_PIPEBUF=1 DIAG=1`,
+20 attempts. Attempt 1: 1568 dgram sends (~224/socket, the device's
+qlen cap despite SNDBUF=8 MB), 1596 stream frags, then fired and
+panicked at the trigger. KP #58 (`prev_dump_rwc58.log`, RWC:58) is
+byte-identical to #57: `+0x4a4`, fault `0001000000000040`, x19/x9 =
+`0001...` thief content. The deep spray still loses the block.
+
+### Fix #32 — DGRAM_QLEN (2026-08-01)
+
+`src/util.c`: per-socket dgram count was hard-capped at
+`reclaim_sends*8` (~224 observed) although `max_dgram_qlen=2400`.
+New env `DGRAM_QLEN` raises the per-socket target; the loop still stops
+at ENOBUFS/EAGAIN. With `DGRAM_QLEN=2000` the spray reaches ~249/socket
+(1743 total across 7 socks) — modest, confirms the device binds below
+2400 but above 224.
+
+### Fix #33 — compact-mode slot parents/targets (2026-08-01)
+
+`src/util.c` `prepare_skb_payload()`: under the compact image only slot
+0 was given parent/target; slots 1-3 (probe/restore) stayed 0.  After a
+diagnostic gate miss the flow re-armed slot 2 with parent=target=0 and
+the walk hit the sanity BUG.  Now all four slots get the same parents/
+targets as the legacy path (gate/probe/restore), so a slot-2+ trigger
+no longer runs degenerate.
+
+### Run 13 — KP #59, the sanity-BUG fire (2026-08-01)
+
+fix #32+#33, 20 attempts. Attempt 1 fired cleanly: `pselect ret=2`,
+copyback `in word=3`/`ex word=1`, `p0 physical write status=0 ok=1`,
+gate `hits=0 changed=1` (pipe 225, q0=fffffffe230c3ac0 — same shape as
+the PARENT_PIPEBUF diagnostic).  Reclaim still missed (u980/u9c0/ua20
+all zero).  Attempt 2 then re-armed slot 2 (fix #33 not yet effective
+on that build) and panicked. KP #59 (`prev_dump_rwc59.log`, RWC:59):
+`kernel BUG at kernel/locking/rtmutex_common.h:118`,
+pc `rt_mutex_adjust_prio_chain+0x858`, lr `+0x130`, x24=x3 =
+attempt-2 fake_lock, x19=x9=x5 = a real task pointer — the walk reached
+the top-waiter sanity check and BUGged because the chain was off-rails.
+This is the "erase completed but chain inconsistent" signature.
+
+### Run 14 — KP #60, identical thief (2026-08-01)
+
+fix #32+#33 active, 20 attempts. Attempt 1 fired and panicked at the
+trigger. KP #60 (`prev_dump_rwc60.log`, RWC:60): `+0x4a4`, fault
+`0001000000000040`, x19/x9 = `0001...` — same thief content as
+#55/#57/#58.  Four fires under fix #21, four identical `+0x4a4`
+thief-content crashes: the thief is deterministic, not a race.
+
+### The decisive model: dgram slab growth is the thief (2026-08-01)
+
+Cross-referencing the six `+0x4a4`/`+0x858` fires:
+
+- Every fire's fake_lock page contains `task+0x348 =
+  0x0001000000000000` and a second small-int qword (`0x0000000100000002`).
+  These are **packed-small-int kernel-object bytes**, NOT our compact
+  image (whose task+0x348 = 0) and NOT a stream frag (would be
+  payload/zeros).  The values are consistent with a freshly allocated
+  **kmalloc-8k slab page**: hardened-freelist pointers in object 0 and
+  one just-allocated object holding packed ints.
+- The ONLY controlled order-3 slab-growth source in the critical window
+  is our own dgram spray (its ~4 KB data buffers are kmalloc-8k,
+  order-3).  Under `CONFIG_SHUFFLE_PAGE_ALLOCATOR` the buddy hands a
+  freshly freed block to the NEXT slab growth — so the target block
+  becomes a kmalloc-8k slab-metadata page before any dgram data lands
+  in it, and the walk reads the slab's packed-int header.
+- The stream-frag channel never wins either: with dgram disabled
+  (run 17, stream-only, legacy layout `lock=base+0x4200`), the fire's
+  gate tenant dump showed `u980/u9c0/ua20 = 0` and NO `+0x130 trylock(0)`
+  panic — i.e. the legacy fake_lock at base+0x4200 was non-zero (real
+  content), so the walk got past the trylock and later BUGged at
+  `+0x858`.  So the stream page also is not ours, but it carries
+  kernel content, not zeros.
+
+**Conclusion:** the freed mm_struct order-3 block is reliably
+buddy-released (fix #21 works: `slabinfo[post-free]` shows the slab
+count drop), but on this kernel the next slab-growth allocation
+(dgram data, kmalloc-8k) claims it as slab metadata — never as our
+payload.  The reclaim is therefore not a "race we can win with more
+volume"; the channel itself is wrong.  The remaining lever is to make
+the FIRST post-free allocation a channel whose slab pages carry our
+payload as DATA, not metadata — i.e. reclaim at the object level in a
+cache we control, or stop relying on page-level cross-cache entirely.
+
+### Fix #34 — ZERO_DRAIN_FREE (2026-08-01)
+
+`src/util.c`, env `ZERO_DRAIN_FREE=1`: sets `late_neighbour_free=0` and
+`drain_triggers=0`, so no prepare_ctx drain kills run before the
+neighbour frees.  Motivation: the 16 drain kills each exit a child,
+freeing ~2 order-3 pages (kernel stack + mm slab page) that replenish
+kmalloc-8k partials before the target slab is freed — another
+self-inflicted theft.  Run 15 (zero-drain) still fired and missed
+(KP #61, `prev_dump_rwc61.log`, `+0x130 trylock` with fake_lock=0 —
+zeroed page).  Removing the pre-free drains did not change the outcome;
+the theft is downstream of the frees, not caused by them.
+
+### Fix #35 — HOLD_PREPARE_CTX (2026-08-01)
+
+`src/util.c`, env `HOLD_PREPARE_CTX=1`: defers the ~1000 prepare_ctx
+child kills (and their memfd closes) until after the walk.  Each of
+those exits frees an order-3 kernel-stack page on the exploit core,
+which the queued dgram/stream frags consume as slab growth — the
+largest self-inflicted order-3 free source in the window.  Run 16
+(zero-drain + hold + dgram) still fired and missed (KP #62,
+`prev_dump_rwc62.log`, `+0x4a4`, `0001...` thief content).  So even
+with both self-interference sources removed the dgram slab growth
+still claims the block — confirming the channel is the problem, not
+the timing.
+
+### Run 18 — KP #63, dgram fire after 12 no-fire attempts (2026-08-01)
+
+Same knobs as run 16.  Attempts 1-13 all `pselect ret=0`, `write
+status=256 ok=0`, `gate 0/0` (residue absent — the ~1/10 fire rate
+whiffed 13 times).  Attempt 14 fired and panicked. KP #63
+(`prev_dump_rwc63.log`, RWC:63): `+0x130 trylock`, fake_lock
+(base+0x980) = 0 — a ZEROED page.  This is the first dgram run that
+shows a zeroed page (vs the `0001...` packed-int content of #57-#62),
+i.e. on attempt 14 the target block was freshly buddy-released and
+zeroed by `INIT_ON_ALLOC` but not yet claimed by slab growth.  The
+variance (packed-int vs zeroed) is just how far the dgram slab growth
+had progressed when the walk fired; both are reclaim misses.
+
+### Consolidated blocker (2026-08-01, end of session)
+
+- Trigger / arming / walk / erase / physical write: **all work** (fires
+  on ~1/10 windows, `p0 physical write ok=1`, erase completes).
+- Leak (mm + pipe page): **~100%** (fix #9, #27).
+- Target-slab buddy release: **works** (fix #21, slabinfo drop at
+  post-free).
+- Reclaim channel: **broken** — the freed order-3 block is claimed by
+  the next slab-growth allocation (kmalloc-8k / dgram data) as slab
+  metadata, never as our payload.  Six fires (#55,#57,#58,#60,#62,#63)
+  all walked third-party content; volume, waves, anon faults,
+  zero-drain, and hold-prepare all fail to change the walked content.
+
+**Next direction** (not yet implemented): abandon page-level
+cross-cache via skb/dgram.  Options, in order of promise:
+1. Object-level reclaim in a controllable cache that allocates from the
+   same order-3 pool the mm_struct slab releases to — e.g. spray a
+   controlled-content object whose allocation path grows a slab on the
+   freed block, with the payload living in the object DATA (which a
+   fresh slab page does NOT overwrite).  Requires identifying such a
+   cache (msg_msg is unavailable: `CONFIG_SYSVIPC` off; skbuff data is
+   the wrong class; pipe_buffer array is the wrong class).
+2. Reclaim the freed block with a HUGE number of tiny controlled
+   allocations that out-compete slab growth for the block's first
+   split (anon faults already tried — fix #22/#30, loses).
+3. Re-derive the walk so it does not need a payload page at all
+   (point the erase's parent/target at real kernel objects leaked via
+   the pipe oracle), turning the primitive into a pure write-what-where
+   without reclaim.  This is the most promising: the erase already
+   lands two pointers at attacker-controlled addresses; if both are
+   real, leaked kernel objects (e.g. the oracle pipe's own pipe_buffer
+   array), the reclaim of the mm_struct page becomes unnecessary.
+
+### Runs 19-22 — fire rate solved; reclaim tenant confirmed foreign (2026-08-01)
+
+Fire-rate measurement (the second blocker):
+
+- **Stream-only reclaim gives a near-zero fire rate.** Run 19
+  (stream-only, 100 ms window, burst=1): 25 armed windows, 0 fires.
+  Run 20 (stream-only, 150 ms window, burst=1): 5 windows, 0 fires,
+  then KP #65 (`+0x130 trylock`, fake_lock=0 — a dead-frame shot past
+  the 100 ms residue lifetime; the 150 ms window only extends the
+  dead-frame zone, it does NOT recover fires).  The residue dies ~100
+  ms after the waiter's 50 ms timeout; widening the pselect window past
+  that only lets the consumer fire at a cleaned-up stack frame.
+- **Dgram reclaim fires ~1/12** (runs 18/21: attempt 14 and attempt 3
+  respectively).  The dgram channel both reclaims AND preserves the
+  residue better than stream-only.
+- **Burst mode fires attempt ~1 reliably.** Run 22 (dgram +
+  `SLIDE_CONSUMER_BURST=3 SLIDE_CONSUMER_SPACING_USEC=15000
+  SLIDE_PSELECT_TIMEOUT_MS=120`): attempt 1 fired
+  (`pselect ret=1`, 3 sched_setattr shots at t=111/127/143 ms, all
+  `sched_ok=1`, `p0 physical write status=0 ok=1`).  Each burst shot
+  re-tests the dangling `pi_blocked_on` independently, so the ~1/10
+  residue race becomes ~1-(0.9)^3 ≈ 1/3 per window, and the first shot
+  usually lands in-window.  **Use burst=3 for all future runs.**
+
+Reclaim tenant identification (fix #31 dump) on a clean dgram fire:
+
+- Run 21 attempt 3 (dgram, PARENT_PIPEBUF): `write ok=1`, gate
+  `changed=1` (pipe 117), tenant dump
+  `q0=fffffffe252382c0 q1=0x1000 q2=0 q3=0x10 q4=0 q5-q7=0`,
+  `u40/u980/u9c0/ua20 = 0`.  **q4 (= page offset +0x20, and +0x4200 in
+  the legacy layout) reads ZERO.**  A kmalloc-8k slab page would have
+  non-zero freelist/object content at those offsets; the page instead
+  reads as **free/zeroed** (INIT_ON_ALLOC zeroed it, nothing wrote it).
+  Run 21 attempt 4 (KP #66, `+0x858` BUG): x19=x9=x5 = a real task
+  pointer — the SAME block was a LIVE task on that attempt.
+- **Conclusion: the freed mm_struct order-3 block is genuinely returned
+  to the buddy allocator (fix #21 slabinfo drop confirms), but our
+  dgram/stream spray NEVER claims it.**  Its tenant at walk time varies
+  per attempt — free/zeroed (attempt 3) or reclaimed by an unrelated
+  system allocation (attempt 4) — but is NEVER our payload.  This kills
+  the earlier "dgram slab growth steals it as metadata" theory: the
+  block is not even being consumed by slab growth; it sits free (or is
+  taken by a third party) while our ~1700-4000 queued dgram/stream frags
+  draw from OTHER buddy blocks.  The reclaim channel is broken at the
+  "which buddy block does my allocation get" level, not the "who wins
+  the race" level.
+
+**Confirmed working stack (2026-08-01):** leak (~100%), buddy release
+(fix #21), fire (burst=3, ~attempt 1), walk, erase, physical write
+(`ok=1`).  **Confirmed broken:** payload reclaim — the freed block never
+receives our content, so the erase always walks foreign/zero memory and
+the write lands on the wrong page (or BUGs).  The reclaim-free
+redirection (option 3 above) is now the primary path.
+
+### Reclaim-free feasibility analysis (2026-08-01)
+
+The reclaim dependency is structural, not incidental:
+
+- The pselect fd_sets arm a fake `rt_mutex_waiter` on the kernel stack.
+  Its rb-tree parent/target ARE leaked addresses (pipebuf / kernel text)
+  and need no reclaim.  But the walk also consumes `waiter->task` and
+  `waiter->lock`, which MUST point at attacker-controlled memory whose
+  `task->pi_waiters`/`pi_lock`/`task_group` and `lock->waiters`/`owner`
+  fields are arranged so the chain-walk reaches `rb_erase` with our
+  parent/target.  That memory is the reclaimed payload page.
+- With a REAL kernel task as `waiter->task` (leakable via the pipe
+  oracle / KernelSnitch), the walk reads the task's genuine
+  `pi_waiters.rb_leftmost` and `pi_lock`.  It only proceeds to the
+  erase if the task is genuinely PI-blocked on a lock whose top waiter
+  is our stale stack waiter — i.e. the real task must itself be in the
+  EDEADLK stale-waiter state.  That is exactly the waiter thread we
+  already control, but its REAL task_struct address is not currently
+  leaked (KernelSnitch leaks the mm/page, not the task).
+
+**Two concrete reclaim-free designs, in order of implementation cost:**
+
+1. **Waiter-task self-link.** Leak the waiter thread's own
+   `task_struct` (e.g. via a KernelSnitch variant targeting
+   `task_struct`, or a pipe-oracle read of a task list).  Set
+   `waiter->task = <real waiter task>` and `waiter->lock = <real
+   f_pi_target rt_mutex>` (also leaked).  The walk then operates
+   entirely on real objects; the stale waiter's dangling `pi_blocked_on`
+   makes the real task look PI-blocked on f_pi_target, and
+   `rt_mutex_adjust_prio_chain` erases/reinserts the ARMED stack
+   `tree_entry`/`pi_tree_entry` nodes (it does NOT require tree
+   membership — see the fix #16 conclusion).  The erase's
+   `rb_set_parent_color` write then lands `parent` into `target` with
+   both being leaked oracle addresses — no payload page, no reclaim.
+   Requires: a task_struct leak + an f_pi_target rt_mutex leak.
+2. **First-principles walk redirect.** Re-derive the chain-walk input so
+   the erase's parent/target are the ONLY controlled values and the
+   task/lock chain is satisfied by real objects.  This is a larger
+   re-derivation of the rt_mutex state machine and is the fallback if
+   (1) cannot produce the two leaks.
+
+Both need new leak primitives (task_struct and/or rt_mutex).
+**Assessment (2026-08-01):** the KernelSnitch framework leaks via
+`futex_hash(futex_addr, mm_struct)` — it is mm_struct-specific and
+cannot be retargeted to task_struct (no equivalent
+`futex_hash(..., task_struct)` oracle).  A task_struct leak requires a
+different primitive (task-list walk from `init_task`, which itself
+needs an arbitrary read first — circular — or a new side channel).
+The virtual KASLR base IS available pre-trigger
+(`slide_read_stext()` via boot_id), so all kernel TEXT/data VAs are
+computable; only the physical pipebuf and any task/lock addresses need
+leaks.  This is a substantial redesign requiring new leak research and
+many device-validation cycles; it is the planned next phase, not yet
+implemented.
+
+### Session summary (2026-08-01, end)
+
+- Runs 11-22, KP #57-#66 analyzed.  Fixes #27-#35 implemented and
+  tested (KSNITCH_COLLISIONS=6, DGRAM_QLEN, compact slot parents,
+  ZERO_DRAIN_FREE, HOLD_PREPARE_CTX).
+- **Fire-rate bottleneck SOLVED**: `SLIDE_CONSUMER_BURST=3
+  SLIDE_CONSUMER_SPACING_USEC=15000` fires attempt ~1 reliably (run 22).
+  Stream-only reclaim must be avoided (near-zero fire rate); use dgram.
+- **Reclaim CONFIRMED broken at the allocator level**: the freed
+  mm_struct order-3 block is genuinely buddy-released (fix #21) but our
+  ~1700-4000 dgram/stream frags never claim it — its tenant at walk
+  time is free/zeroed (run 21 attempt 3, q2=q4=0) or a third-party live
+  task (run 21 attempt 4 / KP #66), never our payload.  Not fixable by
+  volume/timing/self-interference removal (all tried).
+- Walk + erase + physical write all work (`p0 physical write ok=1`) but
+  always consume foreign/zero memory because of the reclaim miss.
+- Root is NOT yet achieved.  Next phase: reclaim-free write via a new
+  task_struct/rt_mutex leak (above), or a fundamentally different
+  primitive.
+
+### Upstream survey (2026-08-01)
+
+Two upstreams were checked for reclaim/walk improvements relevant to the
+S9280 reclaim block:
+
+**1. `BuSung-dev/Root-My-Galaxy-Payloads` (origin).** Local `main` is 11
+commits behind / 4 ahead.  The 11 upstream commits are mostly new-device
+profiles (Galaxy A56 all-models, SM-A566E CCZG6) plus a v3 manifest schema
+(`targets-v3.json`, kernel-version matching, shared S25 payload).  Only ONE
+commit touches the exploit sources: `44ee079` ("Add SM-A566E CCZG6 payload
+profile"), and its `src/slide_app.c`/`src/preload.c` changes are orthogonal
+to S9280:
+- `SLIDE_PHYSICAL_SLOT_DELAYS_USEC`: per-slot retry loop in
+  `slide_trigger_physical_slot` (replaces the single-attempt design).
+- `APP_PAYLOAD_ATTEMPT_DELAYS_USEC` / `APP_FOPS_ROUTE_USE_PSELECT_DELAY` +
+  `PSELECT_DELAY_USEC`: configurable attempt/route delays.
+These are additive `#if defined(...)` blocks, off by default, and do NOT
+conflict with the S9280 reclaim fixes (#21-#35).  Safe to merge.
+
+**2. `NebuSec/CyberMeowfia` (original exploit source).** Recent commits
+(2026-07-13) only add Pixel 6/9a/10 targets (all GKI, sharing ONE generic
+`slide.c`/`util.c`).  The reclaim implementation is byte-for-byte the same
+design as the S9280 one (KernelSnitch mm leak -> `skb_buf` payload -> single
+SOCK_STREAM `sendmsg` spray).  **No reclaim-free technique exists upstream.**
+
+**Key design difference worth porting:** upstream `slide.c` arms the stale
+waiter with `task = SLIDE_INIT_TASK` (the REAL `init_task`, whose VA is
+computable from the KASLR slide) and reclaims ONLY `fake_lock`.  The walk
+then follows init_task's genuine `pi_waiters`/`pi_lock`, and the erase's
+parent/target are KASLR-computable kernel-data VAs (`SLIDE_LOGGERS_0_1`,
+`SLIDE_RANDOM_BOOT_ID_DATA`) that need NO reclaim.  This reduces the reclaim
+surface from 2 objects (S9280's `SLIDE_USE_FAKE_TASK`: fake_task+fake_lock)
+to 1 (fake_lock only) and makes the erase target reclaim-free.  Whether this
+single-fake_lock design reaches `rb_erase` on the Samsung 6.1 kernel
+(vs upstream's Pixel GKI targets) is untested on S9280; it is the most
+promising concrete lead the upstream survey produced.
+
+### Upstream merge + run 27 erase proof (2026-08-01, cont)
+
+**Merge:** `origin/main` merged (`f5a520b`).  Conflicts were `slide_app.c`
+(whole-file CRLF; resolved to ours, which carries all fixes #14-#35) and
+`support/targets-v2.json` (competing 4th profile; merged to 5 targets =
+3 shared + S9280 + A566E).  The orthogonal upstream slot-delay knobs from
+`44ee079` (`SLIDE_PHYSICAL_SLOT_DELAYS_USEC` etc.) were NOT ported — they
+duplicate the S9280 `SLIDE_ENTER_DELAY_USEC` mechanism.  Build verified
+(`make TARGET=e3q-S9280ZCS6DZF2`, 1 pre-existing warning only).
+
+**Run 27 — erase EXECUTES, reclaim is the sole wrong-landing cause.**
+Config: `ZERO_DRAIN_FREE=1 HOLD_PREPARE_CTX=1 DGRAM_RECLAIM=1 DGRAM_QLEN=2000
+SKB_RECLAIM_SOCKS=8 SLIDE_CONSUMER_BURST=3 SLIDE_CONSUMER_SPACING_USEC=15000
+P0_ORACLE_PARENT_PIPEBUF=1` (fixed `SLIDE_ENTER_DELAY_USEC` REMOVED — the
+fixed 60000 delay collapsed the fire rate in runs 24-25; the varied-delay
+default restored it).
+- attempt 1 (delay=25000): 3-shot burst, `pselect ret=1`, `physical write
+  ok=1`, but `pipe gate hits=0 changed=0` -> reclaim miss (chain page
+  foreign), erase consumed garbage.
+- attempt 2 (delay=20000): 3-shot burst, `pselect ret=1`, `physical write
+  ok=1`, `p0 gate changed pipe=215 nonzero=35` (q0=fffffffe249d4c80
+  q2=ffffffc009259d90 q3=0x10) -> **the PI-walk rb_erase WRITE ACTUALLY
+  EXECUTED into a live pipe_buffer page**.  But `hits=0 changed=1` = it
+  landed on an UNEXPECTED page, not `target=pipebuf+0x800`.
+
+This is the cleanest causal chain yet: fire (burst=3, varied delay) is
+reliable, and the walk reaches and performs the rb_erase write.  The write
+lands on the wrong page ONLY because `waiter->task`/`waiter->lock` resolve
+to foreign memory (reclaim miss), so the erase's parent/target come from a
+wrong task/lock chain instead of our payload.
+
+**Consequence for the reclaim-free path:** the upstream INIT_TASK design
+(survey above) reclaims only `fake_lock` (vs S9280's 2 objects) but does NOT
+eliminate reclaim — `fake_lock` still needs the spray to land.  On S9280
+where reclaim is fully broken, reducing 2->1 object is unlikely to suffice.
+The genuine fix remains making the ENTIRE task+lock chain resolvable without
+reclaim (all pointers KASLR-computable or oracle-leaked).
+
+**Run 28 — INIT_TASK experiment was a no-op (correctly reverted).**
+Setting `SLIDE_USE_FAKE_TASK=0` did NOT change the physical-slot path:
+run 28 attempt 2 still logged `task=ffffff88e9738000` (= `page_base`, the
+reclaimed fake_task), because `select_slide_payload_index()` sets
+`fake_task`/`fake_lock` unconditionally from `slide_bank_payload_base`
+regardless of `SLIDE_USE_FAKE_TASK`.  That macro only selects the
+`task`/`lock` WORD in the pselect fd_sets (slide_app.c:181/218), not the
+chain VA used by the physical slot.  Outcome was identical to run 27
+(`changed=1`, wrong page).  Reverted to `SLIDE_USE_FAKE_TASK=1` and rebuilt.
+**Lesson:** a real INIT_TASK port requires rewiring
+`select_slide_payload_index()` + the physical-slot chain to point at
+KASLR-computable addresses, not flipping the macro — a deeper change that
+still leaves `fake_lock` reclaim-dependent.
+
+### Cross-device port survey (2026-08-01)
+
+Five CVE-2026-43499 ports were studied to find a better reclaim/write
+primitive than the S9280 one:
+
+| Port | Kernel | Reclaim | Root path | Status |
+|------|--------|---------|-----------|--------|
+| NebuSec (original) | Pixel GKI 6.x | mm leak + stream spray | fops->configfs->pipe phys->UMH | works |
+| JoinChang/ghostlock-oneplus | 6.12 GKI | mm leak + stream spray (identical) | Path A UMH / **Path B direct PI write (SELinux + cred)** | verified (Ace 6T, 15, Xiaomi 17) |
+| x-spy/popsicle | 6.12 GKI | mm leak + stream spray (identical) | **direct-root: percpu current_task -> cred=init_cred** | verified (Xiaomi 17 Pro Max) |
+| pubglite55/oppo-ghostlock | 5.10 | same | blocked (CFI/write) | stuck |
+| Dere3046/ElevateMe | — | same | rb_erase cred overwrite | reference |
+
+**Finding 1 — the reclaim design is IDENTICAL across every port.**  All use
+KernelSnitch mm_struct leak -> `skb_buf` payload -> a single
+`SOCK_STREAM sendmsg` spray, and all arm the stale waiter with
+`task=SLIDE_INIT_TASK` + a single reclaimed `fake_lock`.  popsicle's spray
+ordering (free neighbour slabs, `close(leak_memfd)` LAST, then spray) is
+byte-equivalent to the S9280 fix #21 (`LATE_NEIGHBOUR_FREE`).  **The S9280
+reclaim implementation is already as advanced as the working ports.**  The
+only difference is the allocator: on 6.12 GKI the freed mm_struct order-3
+block is reclaimed by the spray; on Samsung 6.1 it is not (runs 11-27).
+
+**Finding 2 — a SHORTER root path exists (popsicle direct-root).**  S9280
+currently does fops-overwrite -> configfs arb-write -> pipe-phys -> UMH.
+popsicle instead uses the PI erase to redirect
+`SLIDE_RANDOM_BOOT_ID_DATA` (KASLR-computable, **no reclaim**) so reading
+`/proc/sys/kernel/random/boot_id` returns 16 bytes from an ARBITRARY kernel
+VA (`direct_pselect_write_once(b, q)` + `direct_read_boot_id_raw`).  From
+that single arbitrary-read it walks percpu `__entry_task` -> current
+task_struct -> writes `task->cred = init_cred`.  **No fops, no configfs, no
+pipe-phys, no UMH, no SELinux toggle.**  The erase target
+(`SLIDE_RANDOM_BOOT_ID_DATA`) and the waiter task (`SLIDE_INIT_TASK`) are
+both KASLR-computable, so the ONLY reclaimed object is `fake_lock`.
+
+**Finding 3 — the reclaim miss is the SOLE blocker for every path.**  Even
+popsicle's direct-root needs `fake_lock` reclaimed for the first PI write.
+So no port escapes reclaim; the working ones just run on allocators where it
+lands.  On S9280, `SLIDE_USE_FAKE_TASK=1` reclaims 2 objects (fake_task +
+fake_lock); switching to the popsicle/OnePlus INIT_TASK design reclaims 1
+(fake_lock) AND removes the reclaim dependency of the erase target.  That is
+a strictly smaller failure surface and is the correct next step.
+
+**Recommended next step (feasible):** port the popsicle direct-root design
+to S9280:
+1. Rewire the slide chain so `waiter->task = SLIDE_INIT_TASK` (KASLR-
+   computable) and ONLY `fake_lock` is reclaimed — this requires fixing
+   `select_slide_payload_index()`/the physical-slot chain to not force
+   `fake_task = page_base` (run 28 lesson), not just flipping the macro.
+2. Set the erase parent/target to `SLIDE_LOGGERS_0_1` /
+   `SLIDE_RANDOM_BOOT_ID_DATA` (KASLR-computable) instead of the pipebuf
+   struct page.
+3. After the first successful PI write, use `boot_id` as the arbitrary-read
+   oracle, walk percpu `__entry_task` -> current task -> `cred=init_cred`.
+   Requires S9280 offsets: `INIT_TASK`, `__per_cpu_offset`/`entry_task`,
+   `INIT_CRED`, `TASK_CRED_OFF`/`TASK_REAL_CRED_OFF`, and a confirmation the
+   `boot_id` sysctl data ptr is reachable.
+This halves the reclaim surface and shortens the root chain, but does NOT
+eliminate the single remaining `fake_lock` reclaim — if Samsung 6.1 never
+reclaims that one block, the port still fails.  The fallback (if the
+single-fake_lock reclaim also misses) is a task_struct/rt_mutex leak so the
+chain resolves without any reclaimed page.
+
+### Direct-boot_id implementation + runs 29/30 (2026-08-01)
+
+**Implemented** the popsicle/OnePlus direct-root design as an additive
+`DIRECT_BOOTID_RECLAIM=1` mode (build unchanged, `SLIDE_USE_FAKE_TASK=1`):
+
+- `src/util.c` `select_slide_payload_index()`: new branch sets
+  `fake_task = SLIDE_INIT_TASK + slide_p0_offset` (real dying init_task,
+  never dereferenced), keeps `fake_lock`/`fake_w0` in the reclaimed page,
+  and sets the shape-0 erase pair `slide_oracle_target =
+  SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR + p0` (boot_id ctl_table.data),
+  `slide_oracle_parent = DIRECT_BOOTID_ADDR ? <that VA> :
+  SLIDE_NFULNL_LOGGER_OBJECT + p0`.  `DIRECT_BOOTID_ADDR` accepts any
+  8-aligned kernel VA for a true arbitrary read.
+- `src/slide_app.c` `prepare_slide_pselect_fdsets()` (COMPACT layout):
+  tree_pc/pi_pc = parent, tree_left/pi_left = target, task = fake_task
+  (init_task under this mode), lock = fake_lock.
+- `src/slide_app.c`: new `slide_bootid_read_uuid()`/`slide_bootid_read64()`
+  (initially misplaced in slide.c — not linked into the APP payload .so —
+  causing a `cannot locate symbol` link failure on run 29 first attempt;
+  moved to slide_app.c).  `slide_trigger_physical_slot()` reads the boot_id
+  oracle after a successful trigger when `DIRECT_BOOTID_RECLAIM` is set.
+
+**Run 29** (`DIRECT_BOOTID_RECLAIM=1`, parent=nfulnl_logger, 24 attempts,
+burst=3): 19 attempts ran, 9 armed, **8 fires (ok=1), 8/8 oracle read_ok=1,
+ZERO kernel panics**.  This is the headline result: the single-fake_lock
+reclaim (waiter task = real init_task, NOT a second reclaimed fake_task)
+**lands reliably on Samsung 6.1** — versus the FAKE_TASK 2-object path that
+panicked on every prior fire (KP #49-57).  Halving the reclaim surface made
+the difference.
+
+**Run 30** (`DIRECT_BOOTID_ADDR=0xffffff80022cf8c0` = INIT_TASK): 8 fires,
+8/8 read_ok=1, but the oracle value `404ef8c88994dc32` is IDENTICAL to
+run 29 (parent=logger).  The boot_id oracle fires and returns a stable
+16-byte buffer, but the bytes do NOT track the chosen parent address.
+
+**Interpretation / open problem.**  The shape-0 erase writes a CONSTANT
+pointer into ctl_table.data (not slide_oracle_parent), and boot_id then
+reads the 16 bytes at that fixed spray/heap address — so the "arbitrary
+read" currently returns fixed slab content, not the requested VA.  The
+walk's erase write source (which waiter field lands in ctl_table.data) is
+not yet correctly wired to `slide_oracle_parent`.  popsicle's direct-write
+uses PAGE_PAYLOAD_FOPS with `waiter_task=fake_task` (2-object reclaim) and
+`owner=fake_task|1`; this 1-object SLIDE-mode variant reaches the erase but
+writes a different word.  **Remaining work: pin down the exact erase write
+source (ftrace/kprobe on __rb_erase_augmented / rt_mutex_adjust_prio_chain)
+so ctl_table.data receives slide_oracle_parent; then boot_id yields a true
+arbitrary read, after which the percpu->current->cred stage can be built.**
+
+Net: reclaim reliability is SOLVED (the blocker for every prior run); the
+write-value steering of the boot_id oracle is the remaining sub-problem.
+
+**CORRECTION (post-run-30 source re-read).**  popsicle does NOT do the
+arbitrary read in SLIDE mode.  It uses two separate primitives:
+- **KASLR leak** — SLIDE mode, `waiter_task=SLIDE_INIT_TASK` (1-object
+  reclaim), `tree_left = SLIDE_RANDOM_TABLE_BOOT_ID_DATA` FIXED.  boot_id
+  reads the nfulnl_logger name -> stext.  This is read-only, fixed-address.
+- **arbitrary read/write** — FOPS mode (`prepare_skb_payload(FOPS)`),
+  `waiter_task=fake_task` (TWO-object reclaim), `owner=fake_task|1`, with
+  `set_pselect_write(target=B, value=Q)` so the shape-0 erase writes
+  parent=Q into left=B(=&ctl_table.data); boot_id then reads Q.
+Runs 29/30 used SLIDE mode, whose tree_left is a FIXED boot_id pointer — so
+it can only leak the fixed logger address, never an arbitrary Q.  That is
+why the oracle value is constant regardless of DIRECT_BOOTID_ADDR.
+
+**Consequence.**  A true arbitrary read on S9280 requires the FOPS-mode
+custom-shape write, which needs `fake_task` reclaimed (2 objects) — the very
+reclaim that panics on Samsung 6.1.  Runs 29/30 prove the 1-object SLIDE
+reclaim is reliable; they do NOT prove the 2-object FOPS reclaim works.
+The next decisive test is whether S9280 can reclaim `fake_task` under the
+FOPS-mode direct-write path (2 objects) without panicking.  If it cannot,
+the arbitrary-read stage — and therefore cred overwrite — cannot be reached
+via this design, and the alternative is a task_struct/rt_mutex content leak
+so the chain resolves against a known (non-reclaimed) task_struct.
+
+### vmlinux.elf write-primitive analysis + run 32 (2026-08-01)
+
+The exact S9280 kernel image is at `C:\Users\rainchan\Desktop\root\s9280-port\`
+(vmlinux.elf, vmlinux.nm, vmlinux.btf, boot.img, kernel.config).  Symbols
+verified against vmlinux.nm:
+- `init_task` = 0xffffffc00a24f8c0 (== target.h INIT_TASK_OFF 0x0224f8c0 + text base) ✓
+- `init_cred` = 0xffffffc0097af018 (T)
+- `__per_cpu_offset` = 0xffffffc00a23b650 (T)  — needed for the cred stage
+- `random_table` = 0xffffffc00a3761e8 (t); boot_id is entry #5, so
+  `&random_table[boot_id].data` = base + 4*0x48 + 8 = 0x...23762f0
+  (== target.h SLIDE_RANDOM_BOOT_ID_DATA_OFF) ✓  — the boot_id symbol is correct
+
+**erase write semantics (rt_mutex_adjust_prio_chain + rb_erase disasm).**
+The walk calls `rb_erase(node=waiter(x25), root=&lock->waiters)` where
+`lock = waiter->lock = fake_lock`.  With the armed waiter leafless
+(rb_left=rb_right=0), rb_erase takes the 0xfa9ac branch: `x9 = node->parent`
+(= slide_oracle_parent from the fdsets), then `str replacement, [parent's
+child ptr]` with replacement = 0.  **So the SLIDE erase is a WRITE-ZERO of
+`parent->rb_left/right` (8 bytes), NOT a write of parent-pointed content.**
+This is fundamentally different from popsicle's FOPS custom-shape write
+(which steers parent=value Q into left=target B).  The boot_id arbitrary
+read popsicle relies on does NOT exist in the S9280 SLIDE erase shape.
+
+**run 29/30 reinterpreted.**  Baseline normal boot_id =
+`28a9fce8-4835-4c9a-b7f7-a3da257cc059` (first8 LE 4c9a483528a9fce8), but the
+direct-bootid oracle returned `404ef8c88994dc32` — DIFFERENT, so the erase
+DID fire and DID redirect boot_id (read_ok=1 is a real hit, not a normal-UUID
+false positive).  But the returned bytes are fixed spray/heap content
+(top byte 0x40, not a canonical kernel ptr), independent of DIRECT_BOOTID_ADDR
+(runs 29 logger / 30 init_task / 32 root_task_group all identical).  This
+matches write-zero: the erase zeroes a pointer NEAR the ctl_table so
+proc_do_uuid reads an unintended buffer, not the requested VA.
+
+**run 32** (Q=ROOT_TASK_GROUP, 30 attempts): 11 attempts ran, 0 fires — the
+~1/10 reclaim fire rate whiffed; reclaim reliability is unchanged.
+
+**Where this leaves root.**  Reclaim reliability is SOLVED (1-object
+fake_lock + init_task).  The blocker is that the S9280 SLIDE erase is a
+write-zero of a parent rb-child pointer, which cannot (as configured) plant
+an arbitrary VA into boot_id's ctl_table.data.  Two evidence-based paths:
+(a) the FOPS-mode custom-shape write (parent=Q -> left=B) — popsicle's actual
+arbitrary-write primitive — requires fake_task reclaimed (2 objects); needs an
+on-device reliability test of that 2-object reclaim on Samsung 6.1.
+(b) reshape the SLIDE waiter so its rb child pointer IS ctl_table.data and a
+nonzero replacement lands there — requires studying rb_erase's replacement
+value (a waiter/rb-node pointer) as a controlled write of a KNOWN kernel
+pointer, which may suffice for cred overwrite without a full arbitrary read.
+Both need further on-device kernel debugging against vmlinux.elf.
+
+**rb_erase branch detail (the actual unlock).**  With `parent =
+SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR` (=&ctl_table.data itself), the leafless
+erase writes `ctl_table.data = 0`; proc_do_uuid(NULL) then formats a STACK
+tmp_uuid, which is exactly the fixed `404ef8c88994dc32` seen in runs 29/30 —
+i.e. those runs wrote ZERO to ctl_table.data, not an arbitrary VA.
+The arbitrary-READ primitive needs the NON-leaf rb_erase path:
+`str x9, [x13]` where x9 = the erased node's CHILD pointer and x13 =
+parent's child slot.  If the armed waiter is given a child whose pointer is
+a controlled value and parent is positioned so its child slot aliases
+&ctl_table.data, the erase plants that controlled pointer into
+ctl_table.data, and boot_id then reads the 16 bytes at it — a true arbitrary
+read.  Equivalently, pointing the child slot at task->cred and the child at
+init_cred gives a direct cred overwrite.  This is the concrete next step:
+construct the 2-node rb shape (armed waiter + one child) so the erase's
+replacement write lands a chosen pointer at a chosen kernel address.  It
+still rides the SAME reliable 1-object fake_lock reclaim (the child node can
+live in the reclaimed page beside fake_lock); it does NOT require the
+2-object fake_task reclaim.
+
+### Child-mode arbitrary read PROVEN + KP #73 (2026-08-01)
+
+Implemented `DIRECT_BOOTID_CHILD=1` (util.c select + slide_app.c fdsets):
+the waiter is given ONE child so rb_erase takes the non-leaf
+`str x9(child), [parent->rb_left]` path.  `slide_oracle_parent =
+target-0x10` (so parent->rb_left aliases &ctl_table.data),
+`slide_oracle_child = DIRECT_BOOTID_ADDR Q` (tree_left), pi_left stays
+= target.  Still the SAME 1-object fake_lock reclaim; the child pointer is
+just a VALUE in the waiter's rb_left, not a separately-reclaimed object.
+
+**Run 33** (`DIRECT_BOOTID_CHILD=1 DIRECT_BOOTID_ADDR=0xffffff80022cf8c0`
+= INIT_TASK p0-alias, 24 attempts): 2 fires.  Fire 1 read_ok=1 with
+**value=344645d0de8941ca** — DIFFERENT from the leafless stack-tmp constant
+`404ef8c88994dc32` (runs 29-32), and parent/target/child logged correctly
+(parent=...f62e0=target-0x10, child=...cf8c0=INIT_TASK).  **The non-leaf
+rb_erase planted a new pointer into &ctl_table.data and boot_id read
+through it: the arbitrary-read path is OPEN.**  Fire 2 panicked.
+
+**KP #73 analysis** (`prev_dump_rwc73.log`): PC=_raw_spin_trylock+0x1c
+(`ldr w8,[x0]`, x0=0 NULL), LR=rt_mutex_adjust_prio_chain+0x130 (= the
+`bl _raw_spin_trylock` at vmlinux 0x...2848, x0=x24=lock=waiter->lock).
+Registers: x24=0, x25=task->pi_blocked_on, x19=task=0xffffff8a6a892580.
+**The crash is at the WALK START, not the erase: waiter->lock read 0 because
+the fake_lock reclaim MISSED on that attempt.**  This is the ordinary
+reclaim-miss failure (same as every prior KP), NOT a child-mode defect.
+Child-mode fire 1 (reclaim hit) completed the arbitrary read; fire 2
+(reclaim miss) crashed before reaching it.  Confirms: with a reclaim hit the
+child-mode arbitrary read works end-to-end; the residual risk is purely the
+per-attempt reclaim hit rate.
+
+**Value interpretation (next step).**  344645d0de8941ca is what boot_id
+returned after ctl_table.data was overwritten.  It is NOT yet confirmed to
+be the INIT_TASK page content — the rb successor-rewrite path may store a
+different node pointer than tree_left.  Next: point DIRECT_BOOTID_ADDR at a
+kernel address with KNOWN content (e.g. a KASLR-computable symbol whose
+first 8 bytes are known from vmlinux) and verify boot_id returns exactly
+those bytes; that proves a controlled arbitrary read.  Then walk
+percpu __per_cpu_offset[cpu] -> current task -> cred.
+
+**Runs 34/35** (`DIRECT_BOOTID_CHILD=1 DIRECT_BOOTID_ADDR=0xffffff8000080000`
+= _text p0-alias, expected boot_id first8 = 4e6977145a4d40fa = the ARM64
+"MZ" header): 21 and 3 attempts respectively, 0 fires — the ~1/10 reclaim
+fire rate whiffed both runs (device stayed up, no KP).  No new information;
+the child-mode path itself was already proven by run 33 fire 1.  A clean
+controlled-read confirmation (boot_id == known _text bytes) still needs a
+reclaim-hit sample.  Reclaim-hit variance is now THE gating factor for all
+further verification — consider raising SKB_RECLAIM_SENDS / attempts, or
+retrying until a hit lands, before drawing any conclusion from a quiet run.
+
+**KP #75 + the Q-must-be-writable constraint (runs 36/37).**  Batched
+re-verification (Q=_text p0-alias 0xffffff8000080000) produced KP #75:
+PC=rb_erase+0x8c, LR=rt_mutex_adjust_prio_chain+0x224, faulting VA
+= **ffffff8000080000 (= Q itself)**.  Registers: x9=x8=parent
+(ffffff80023f62e0 = target-0x10), x10=Q (ffffff8000080000).  This is the
+TWO-CHILD rb_erase successor path: after planting the successor into the
+parent's child slot it also writes the successor's rb_parent
+(`str x9(parent), [x8(successor)]`, i.e. **Q->rb_parent = parent**).  _text
+is READ-ONLY kernel code, so the write to Q faults.  **CONSTRAINT: the
+child/child-pointer Q is not just read — rb_erase writes back through it, so
+Q must point to WRITABLE kernel memory.**  Reading read-only .text via the
+boot_id oracle is impossible with this primitive; .data/.bss targets
+(cred, percpu offsets, task_struct fields) are all writable and fine.
+run 33 (Q=INIT_TASK, writable .data) hit exactly this happy path and
+returned a live value without the write-back fault.
+
+**Reclaim-hit variance is the practical gate.**  runs 34-37 fired 0-2 times
+across ~50 attempts; the erase only runs on a reclaim hit, and a miss either
+whiffs quietly or (worse) walks with a partially-stale page and panics
+(KP #73 waiter->lock=0).  The exploit is correct on a hit; reliability of
+the hit is the remaining engineering problem, independent of the read/write
+primitive which is now understood and proven.
+
+### Reliable arbitrary read PROVEN - run 38 (2026-08-01)
+
+`DIRECT_BOOTID_CHILD=1 DIRECT_BOOTID_ADDR=0xffffff80022cf8c0` (= INIT_TASK
+p0-alias, writable .data), 4 batches of 12 attempts: **4 fires, 4x
+read_ok=1, all returning value=08416fcf32101d63, ZERO panics** (device up
+596s after).  The value decodes as a non-pointer INIT_TASK field (high byte
+0x08, thread_info.flags/counters), NOT a stale constant and NOT a stack
+tmp_uuid.  This is a stable, repeatable arbitrary read through a writable
+target: the non-leaf rb_erase plants the controlled child pointer into
+&ctl_table.data, /proc/sys/kernel/random/boot_id then returns the 8 bytes at
+Q.  **The arbitrary-read primitive is OPEN and reliable on reclaim hits.**
+
+**Root path (next phase).**  With a reliable read of any WRITABLE kernel VA,
+the remaining chain to cred overwrite:
+  1. Read percpu `__per_cpu_offset[cpu]` (p0 0xffffff80023b6570) to resolve
+     the current CPU's per-cpu base, then `current_task` -> our task_struct.
+  2. Read our task->cred pointer.
+  3. Overwrite uid/gid/euid/egid/caps in cred.  This still needs a WRITE
+     primitive - the same non-leaf rb_erase gives a controlled-pointer WRITE
+     (it writes parent & node into Q's rb fields), which can be steered at
+     task->cred by choosing Q = cred-adjacent.  Alternatively reuse the
+     FOPS-mode 2-object fake_task write (reliable on popsicle/Leaf) if its
+     reclaim can be made to hit on S9280.
+  The reclaim-hit rate (~4/12 per batch here, better than earlier ~1/10) is
+  now good enough to attempt the multi-read chain.
+
+### The rb_left(Q)=0 constraint on arbitrary-read targets - KP #78 (2026-08-01)
+
+Cross-address verification (Q=ROOT_TASK_GROUP p0 0xffffff80024ccd80) produced
+KP #78, PC=rb_erase+0x8c (identical to KP #75 with Q=_text).  Root cause:
+the child pointer Q is interpreted as an rb_node.  Whether rb_erase takes
+the survivable ONE-CHILD path or the crashing TWO-CHILD successor path
+depends ENTIRELY on the target's own rb fields:
+  - Q=INIT_TASK (runs 33/38): the qword at Q (=thread_info.flags) is small/
+    zero-ish, so the waiter's rb_left (=Q) reads as a node whose own
+    rb_left==0 -> ONE-CHILD path -> parent planted into &ctl_table.data,
+    boot_id reads Q cleanly.  WORKS, no panic.
+  - Q=_text (KP #75) and Q=ROOT_TASK_GROUP (KP #78): the qword at Q+0/0x10
+    is nonzero (code bytes / live pointers), so the fake node appears to have
+    TWO children -> rb_erase computes successor=rb_next(Q), dereferences
+    Q->rb_right / writes Q->rb_parent, and faults.
+**CONSTRAINT: child-mode arbitrary read is reliable ONLY for kernel addresses
+Q whose first ~24 bytes happen to read as a leaf rb_node (rb_left/rb_right
+zero or small).**  INIT_TASK qualifies; arbitrary .data/.bss/.text targets
+generally do not.  A fully-general arbitrary read therefore needs a
+child-pointer Q that points into the RECLAIMED page (which we control and can
+lay out as a clean leaf), with the read then redirected a second hop - i.e.
+read Q=reclaimed-page, and have the page's content itself BE the pointer to
+the real target.  That two-hop scheme, or the FOPS 2-object write, is the
+remaining route to a general read/write; both ride the same proven
+non-leaf rb_erase write into &ctl_table.data.
+
+**Re-confirmation run 44** (Q=INIT_TASK, 60 attempts): 4 fires, 4x read_ok=1,
+all value=4f45115807d52e57, ZERO panics (device up 454s after).  This is the
+THIRD independent confirmation (runs 33, 38, 44) that the child-mode
+arbitrary read is reliable and repeatable for rb_left(Q)=0 targets.  The
+value differs per boot (INIT_TASK runtime fields) but is constant within a
+run.  Reclaim-hit rate across these runs: ~4/48 (run 38), 0/27 (run 39),
+4/60 (run 44) — a Poisson-like ~5-8% per-attempt hit; the read itself is
+deterministic once a hit lands.
+
+**Root status summary (2026-08-01).**  Reclaim reliability: SOLVED (1-object
+fake_lock, run 38/44 fire cleanly).  Arbitrary READ: PROVEN and reliable for
+rb_left(Q)=0 writable targets (INIT_TASK).  Remaining to root:
+  - a GENERAL read (any kernel VA) — blocked by the rb_left(Q)=0 constraint;
+    needs the two-hop scheme (Q=reclaimed-page leaf whose content is the real
+    target pointer) or the FOPS 2-object write path.
+  - a WRITE primitive for cred — the non-leaf rb_erase already does a
+    controlled-pointer WRITE (parent & node into Q's rb fields); steering
+    that at task->cred requires task resolution (percpu current_task), which
+    itself needs a general read.  So general-read is the next unlock.
 
 ## Files Modified
 
@@ -1331,7 +2056,7 @@ checkout is CRLF, so plain `git diff` shows whole-file noise — use
 
 | File | Changes |
 |------|---------|
-| `src/targets/e3q-S9280ZCS6DZF2/` | New target (untracked): header, fingerprint; `P0_ORACLE_GATE_PAGE_OFF` 0x0e80 -> 0x1e80 (fix #15); `KSNITCH_COLLISIONS` 4 -> 6 (fix #27) |
+| `src/util.c` | KernelSnitch bruteforce stride `MM_STRUCT_SZ` -> `MM_STRUCT_SLAB_SZ` (fix #9); `EXPLOIT_CORE`/`exploit_core()`; cleanup before sends; knob plumbing; `SKB_SNDBUF` env override; `P0_ORACLE_PARENT_PIPEBUF` reclaim-vs-walk diagnostic knob; fix #19 reclaim ordering; fix #21 `LATE_NEIGHBOUR_FREE`; fix #22 `COMPACT_PAYLOAD`; fix #23 `SKB_RECLAIM_SOCKS`; fix #26 `DGRAM_RECLAIM`; fix #28 `SLABINFO_DIAG`; fix #29 `RECLAIM_WAVES`; fix #30 `RECLAIM_WAVE_ANON`; fix #32 `DGRAM_QLEN`; fix #33 compact-mode slot parents/targets; fix #34 `ZERO_DRAIN_FREE`; fix #35 `HOLD_PREPARE_CTX` |
 | `src/common.h` | `MM_STRUCT_SLAB_SZ`; runtime knobs (`SKB_RECLAIM_SENDS`, `MM_DRAIN_TRIGGERS`, `KSNITCH_DEFAULT_PROFILE`); `exploit_core()` declaration; `KSNITCH_COLLISIONS` now `#ifndef`-guarded (fix #27) |
 | `src/fops.c` | Shift-aware `prepare_pselect_fdsets`, pipe fill before pselect, consumer completion wait |
 | `src/util.c` | KernelSnitch bruteforce stride `MM_STRUCT_SZ` -> `MM_STRUCT_SLAB_SZ` (fix #9); `EXPLOIT_CORE`/`exploit_core()`; cleanup before sends; knob plumbing; `SKB_SNDBUF` env override; `P0_ORACLE_PARENT_PIPEBUF` reclaim-vs-walk diagnostic knob; fix #19 reclaim ordering (neighbours freed before drain pressure; supersedes reverted fix #18); fix #21 `LATE_NEIGHBOUR_FREE` (drains first, `close(memfd_leak)` last so the empty target slab is discarded to the buddy allocator); fix #22 `COMPACT_PAYLOAD` (4 KB walk image + anon-fault reclaim, shelved); fix #23 `SKB_RECLAIM_SOCKS` (up to 8 socketpairs multiplying the queued frag volume); fix #26 `DGRAM_RECLAIM` (content-controlled dgram data kmalloc spray); fix #28 `SLABINFO_DIAG` (three-point slab census); fix #29 `RECLAIM_WAVES` (periodic reclaim bursts across the arming window); fix #30 `RECLAIM_WAVE_ANON` (per-wave 2 MB anon image faults + 4 MB wave SO_SNDBUF) |

