@@ -638,6 +638,691 @@ vs reclaim is the next diagnostic step.
   (still absent after `adb kill-server`; check the phone physically —
   it may be in a boot loop or powered off).
 
+### PARENT_PIPEBUF diagnostic (2026-08-01) — blocker resolved: it is reclaim, not the walk
+
+Experiment planned under "Next steps (a)" above, now implemented and run:
+
+- New env knob `P0_ORACLE_PARENT_PIPEBUF` (`src/util.c`,
+  `prepare_skb_payload()`): for the gate slot, `parent` is set to
+  `direct_to_page(pipebuf_page_base)` instead of `direct_to_page(base)`.
+  A completed erase then flips the gate pipe's read-back **no matter where
+  the payload reclaim landed**, separating "erase never completed"
+  (residue missing / walk stalled) from "erase completed but the marker
+  page is wrong" (reclaim miss).
+- Command (background, log to file):
+  `adb shell "P0_ORACLE_PARENT_PIPEBUF=1 P0_ORACLE_GATE_DIAG=1 \
+  SKB_SNDBUF=4194304 SKB_RECLAIM_SENDS=128 SLIDE_ENTER_DELAY_USEC=60000 \
+  SLIDE_CONSUMER_BURST=1 EXPLOIT_ATTEMPTS=10 \
+  LD_PRELOAD=/data/local/tmp/cve-2026-43499-app-dbg.so /system/bin/id"`
+  (full log: `/tmp/parent-pipebuf-run.log`; ~10 min for 10 attempts, do
+  not poll — read the file after completion).
+- Result: 21 pselect windows across 10 attempts (some slots re-arm), 20 ×
+  `ret=0`, **1 × `ret=2`** (attempt 10, slot=0). The fire completed the
+  erase: `p0 physical write status=0 ok=1` and
+  `p0 pipe gate hits=0 changed=1`, with the changed pipe (pipe=21) reading
+  back `q0=fffffffe2170abc0 q1=0x1000 q3=0x10` — i.e. the gate pipe's
+  `pipe_buffer` no longer points at the marker page. The erase works
+  end-to-end when it fires. **Conclusion: the walk/erase mechanism and the
+  arming geometry are sound; the sole remaining blocker is the payload
+  reclaim (cross-cache placement of the marker page onto the freed pipe
+  page), plus the low fire rate (~1/20 windows).**
+- Detail worth noting: `q0=fffffffe2170abc0` does not equal the printed
+  `parent=fffffffe23990a00`, so the observed read-back is not simply
+  `parent|color` — the exact write-to-readback mapping should be
+  re-derived when the reclaim work starts (it matters for picking the
+  final `parent` in the real run).
+- Device survived the whole run (no panic; the watchdog entry RWC:44 in
+  `power_off_reset_reason.txt` predates it). Two USB adb drops observed
+  with uptime intact — adb "device lost" on this setup is usually the
+  cable/hub, not a crash; verify with `adb shell uptime` before assuming a
+  reboot.
+
+### Fix #18: free target-slab neighbours last, immediately before reclaim sends (2026-08-01)
+
+Root cause analysis of the reclaim miss (`src/util.c`,
+`prepare_kernel_page()`):
+
+- The "mm objects" are `open("/proc/<pid>/mem")` fds pinning each cloned
+  child's `mm_struct`; `close()` is what frees the `mm_struct` into the
+  slab. Children are pinned to `exploit_core()` (`clone_child()`), and all
+  closes run in our pinned process, so the freed slab page returns to the
+  same CPU's pcp/buddy — locality is fine.
+- The leak (`ks->mm_struct`) is the mm pinned by `memfd_leak`; its slab
+  page also holds neighbouring objects belonging to `pre_ctx`/`post_ctx`
+  fds. The target page therefore cannot return to the buddy allocator
+  before the LAST of those fds closes.
+- The old order closed `pre_ctx`/`post_ctx`/`memfd_leak` EARLY, then ran
+  the slow bulk cleanup (`kill_child`+`waitpid` for drain triggers and all
+  of `prepare_ctx`, each child exit doing kernel allocations), and only
+  then sent the skb reclaim frags. If the target page's last object was in
+  that early batch, the freed order-3 page sat exposed for the whole
+  cleanup — long enough for unrelated allocations to steal it (the KP #37
+  outcome: anon memory split the block).
+- Fix #18 moves ALL `pre_ctx`/`post_ctx`/`memfd_leak` closes to after the
+  `prepare_ctx` cleanup, immediately before the reclaim `sendmsg()` loop.
+  The window between "target page becomes free" and "first skb frag
+  allocation" is now just a few dozen `close()` syscalls (<1 ms).
+- Validation run (same command as the PARENT_PIPEBUF diagnostic but
+  WITHOUT that knob, so a completed erase writes
+  `parent = direct_to_page(base)`): a fire then produces `gate hits>=1`
+  iff the reclaim landed on our marker page, `changed>=1` iff the erase
+  completed but the page is not ours. Log: `/tmp/fix18-reclaim-run.log`.
+- Operational lesson (2026-08-01): after a DIAG fire, the restore path
+  leaves a `p0 reference keeper` process behind (visible as a reparented
+  `id` process, e.g. pid 23736) holding all 240 oracle pipes. The
+  accumulated pipe pages push uid 2000 over the per-user pipe-page limit,
+  and every subsequent attempt then dies at
+  `fcntl(F_SETPIPE_SZ): Operation not permitted` → "pipe page child did
+  not report base". Always `adb shell kill -9 <keeper-pid>` (check
+  `ps -A | grep ' id$'`) before a new run. The first fix #18 validation
+  run was lost to this; rerun as `/tmp/fix18-reclaim-run2.log`.
+- Operational lesson 2 (2026-08-01): a completed DIAG fire corrupts kernel
+  memory by design (the erase's second write `[parent+8]=target` hits a
+  live `struct page` in vmemmap). The device can crash MINUTES LATER in
+  unrelated code. Evidence — KP #45 (RWC:45, dump `prev_dump_rwc45.log`):
+  `___slab_alloc+0x770` from `clone → copy_files → dup_fd → alloc_fdtable
+  → __kmalloc_node`, fault addr `0x58c` (garbage freelist pointer), with
+  `x23=ffffffe23990a00` / `x4=...+0x20` — exactly the DIAG run's
+  `parent=direct_to_page(pipebuf_page_base)` value, i.e. the corrupted
+  page struct. The crashing task was run2's attempt-1 child during its
+  clone spray — an innocent kmalloc tripping the freelist planted by the
+  earlier fire. So run2 told us nothing about fix #18; treat any post-fire
+  boot as compromised and evaluate results only from a clean boot.
+- fix #18 validation run3 (`/tmp/fix18-reclaim-run3.log`) runs on the
+  fresh boot that followed KP #45.
+
+### KP #46: the walk reaches the wake step — and proves the reclaim miss (2026-08-01)
+
+Run3 attempt 2 fired and panicked mid-window (dump `prev_dump_rwc46.log`,
+RWC:46):
+
+- Signature: `BRK handler PC:queued_spin_lock_slowpath+0x310` (BRK
+  #0x5512) in our exploit process (`Comm: id`).
+- Call trace: `sched_setattr → __sched_setscheduler → rt_mutex_adjust_pi →
+  rt_mutex_adjust_prio_chain+0x848 → wake_up_state → try_to_wake_up+0x60 →
+  _raw_spin_lock_irqsave → queued_spin_lock_slowpath`. The chain walk went
+  PAST the erase (+0x220) and the sanity check (+0x858 region) all the way
+  to the final wake of the chain's top task — the furthest the trigger has
+  ever been observed to go. The erase itself executed (no +0x220 crash).
+- Registers: `x0/x8/x21 = ffffff8870bc0924 = page_base+0x924` (the fake
+  task's `pi_lock`, offset +0x924 as established), `x3 =
+  ffffff8870bc4200` (the printed fake_lock), `x20 = page_base`. The walk
+  consumed the attempt-2 page as designed — but `pi_lock` was garbage
+  (nonzero → slowpath → sanity BRK), while the payload memset it to 0 and
+  the erase's writes never touch `page_base+0x924`. Conclusion: **the page
+  content was NOT our payload — the reclaim missed again**, and the walk
+  ran on garbage. KP #46 is therefore the clean "reclaim miss" signature:
+  crash in the wake step taking a garbage `pi_lock`, not in the erase.
+- Why fix #18 made reclaim impossible: an empty slub slab sits on the
+  per-node partial list and only returns to the buddy allocator (where the
+  skb order-3 frags can claim it) when partial-list pressure discards it.
+  Fix #18 freed the target-slab neighbours AFTER the drain/cleanup
+  pressure, so the target page never reached the buddy allocator before
+  the sends. Fix #19 reverts the ordering (neighbours → drains → prepare
+  cleanup → sends) and the validation run adds pressure/volume knobs:
+  `MM_DRAIN_TRIGGERS=8 SKB_SNDBUF=8388608 SKB_RECLAIM_SENDS=256`
+  (`/tmp/fix19-reclaim-run.log`).
+
+### KP #47 + fix #20: shrink the buddy-exposure window to the drain kills (2026-08-01)
+
+- fix #19 run (`/tmp/fix19-reclaim-run.log`): 5 attempts reached the
+  window, 8 × `ret=0`, then attempt 5 fired and panicked (RWC:47, dump
+  `prev_dump_rwc47.log`): `_raw_spin_trylock+0x1c` /
+  `rt_mutex_adjust_prio_chain+0x130`, fault addr 0 (the historical
+  `waiter->lock=0` signature), `x27=x3=ffffff88d7f04200` = attempt 5's
+  fake_lock. The walk again consumed non-payload content — reclaim miss.
+  Two fires, two misses (#18→KP#46, #19→KP#47); the knob increases alone
+  do not beat the theft race.
+- Failure model refinement: with #19 the target page reaches the buddy
+  allocator during the drain triggers, but the ~100+ remaining
+  `prepare_ctx` child kills between the drains and the sends are all
+  exit-path allocations on our core — a long theft window (KP #37 showed
+  anon memory wins that race).
+- Fix #20 (`src/util.c`): the reclaim `sendmsg()` loop now runs
+  IMMEDIATELY after the drain triggers; the remaining prepare_ctx cleanup
+  is deferred until after the sends. Window between "target page in buddy"
+  and "first frag allocation" shrinks from ~100+ child exits to the 8
+  drain kills. Attempts whose target slab still holds a prepare_ctx
+  object (rare — the leaked object and its neighbours live in
+  pre/post/leak) simply miss, same expected value as before.
+- Panic-signature cheat sheet for future fires: `+0x130 trylock /
+  waiter->lock=0` or wake-step garbage `pi_lock` (BRK in qspinlock) =
+  reclaim miss; `+0x220 rb_erase` crash = erase write hit a bad target;
+  clean `gate hits=1 changed=0` = reclaim hit, proceed without DIAG.
+
+### Three fires, three misses — order-0 anon-grab hypothesis (2026-08-01)
+
+- fix #20 run (`/tmp/fix20-reclaim-run.log`): attempt fired → KP #48
+  (RWC:48, `prev_dump_rwc48.log`), byte-identical signature to KP #47
+  (`+0x130 trylock`, fault addr 0, `x27=x3=<fake_lock>`). Count so far:
+  KP #46 (fix #18), KP #47 (fix #19), KP #48 (fix #20) — every fire walks
+  non-payload content. Tightening the free→send window does not win the
+  race, which suggests the skb order-3 channel itself is the problem,
+  not the timing.
+- New hypothesis (from KP #37's anon-theft evidence): the freed order-3
+  block reliably reaches the buddy allocator but gets split and consumed
+  by order-0 allocations before our frags queue. Weaponise it: reclaim
+  with OUR OWN anon faults. Buddy splitting hands out the block's FIRST
+  4 KB page first, so a compact payload living entirely in
+  `page_base+0x000-0xFFF` (task 0x000-0x960 fits; lock/waiters/marker
+  move up from 0x4200/0x5200 into 0x980-0xFFF) would be reclaimable via
+  a handful of mmap faults — with fully controlled content.
+- Current layout for reference (`targets/e3q-S9280ZCS6DZF2/target.h`):
+  `SKB_DATA_DELTA=-0x1000` so payload index I ↔ base+I-0x1000;
+  `SLIDE_BANK_TASK_OFF 0x1000` (task ↔ base+0x000, pi fields to +0x958),
+  `SLIDE_BANK_LOCK_OFF 0x5200` (lock ↔ base+0x4200), slots stride 0x100,
+  gate marker at payload 0x1e80 (↔ base+0xe80).
+- Cheap decisive test first (`ANON_GRAB_TEST=1`, `/tmp/anon-grab-run.log`):
+  after the drains, fault 256 anon pages filled with 0x41, then send the
+  skb frags as usual. If a fire's crash dump shows 0x4141414141414141 in
+  the walk registers (or fault addr like 0x41414141414141xx), anon faults
+  DO win the freed page → build the compact 4 KB payload. If it shows
+  random garbage again, the page is going somewhere else entirely
+  (re-examine whether it reaches the buddy allocator at all).
+
+### KP #49 — ANON_GRAB_TEST verdict: the page never leaves the mm_struct cache (2026-08-01)
+
+- Run (`/tmp/anon-grab-run.log`, dump `s9280-port/lastkmsg_49.txt`): a fire
+  happened after the 256-page 0x41 anon grab. Crash dump: fault addr still
+  0, no `0x4141414141414141` anywhere in the walk registers. Neither our
+  order-0 anon faults NOR the order-3 skb frags got the page.
+- The waiter pointers the walk consumed were "plausible" kernel pointers
+  (`x19`/`x9` in the same 32 KB region, ~0x4b00 apart — looks like a real
+  mm_struct's VMA rb pointers): the leaked slot was reallocated as
+  ANOTHER mm_struct. The freed page never left the mm_struct cache; the
+  emptied slab stayed on the SLUB partial list and concurrent system
+  forks refilled it before any of our reclaim channels ran.
+- This invalidates the page-level cross-cache premise on this device
+  (fixes #18/#19/#20 were all timing variants of the same losing race)
+  and kills the "compact 4 KB payload + anon reclaim" plan above: the
+  block never reaches the buddy allocator, so no buddy-based channel
+  (skb frags, anon faults) can ever claim it.
+
+### Fix #21 — LATE_NEIGHBOUR_FREE: force the empty slab to the buddy allocator (2026-08-01)
+
+- Discarded alternative (object-level msg_msg cross-cache): the handoff
+  plan was to spray 0x3d0-byte msgsnd messages (0x30 header + 0x3d0 =
+  0x400) to reuse the freed mm_struct SLOTS directly. Dropped: device
+  slabinfo shows `mm_struct` is a DEDICATED cache
+  (`mm_struct  1000  1160  1024  32  8`), not kmalloc-1k, and msg_msg is
+  allocated with GFP_KERNEL_ACCOUNT (kmalloc-cg-1k). Wrong cache — object
+  reuse across caches is impossible. Only mm_struct allocations (fork)
+  ever occupy those slots, and we do not control fork's content.
+- Root cause re-read: an empty slab is discarded to the buddy allocator
+  ONLY when `__slab_free` runs with `nr_partial >= min_partial` (default
+  5). Fixes #19/#20 freed the target-slab neighbours FIRST — the slab
+  emptied while the partial count was still ~0, so it went onto the
+  partial list instead of the buddy allocator, and forks refilled it.
+  The drains that WOULD have raised the pressure ran afterwards. The
+  ordering was exactly backwards.
+- Fix #21 (`src/util.c`, env `LATE_NEIGHBOUR_FREE=1`): swap the two
+  phases. (1) Run the prepare-spray drains FIRST — each killed prepare
+  child frees one mm from a distinct full slab, turning it partial;
+  with `MM_DRAIN_TRIGGERS=8`, `nr_partial` reaches ~8 > min_partial.
+  (2) Then free the neighbours (spray/pre/post closes as before) and
+  FINALLY `close(memfd_leak)` — the last object of the target slab.
+  That final `__slab_free` now sees `nr_partial >= min_partial` and
+  discards the empty order-3 slab to the buddy allocator.
+  (3) The skb reclaim sends run immediately after (fix #20 ordering
+  kept), so the buddy window is microseconds. `kill_child` is
+  synchronous (`waitpid` after SIGKILL), so each drain's mm free has
+  fully landed before the neighbour closes begin.
+- Expected read-out, same cheat sheet: `+0x130 trylock / waiter->lock=0`
+  or 0x41-free garbage = reclaim still missing (then dump
+  `/proc/slabinfo` partial counts via a root-side channel is moot — next
+  step would be raising `MM_DRAIN_TRIGGERS`); clean `gate hits=1
+  changed=0` = reclaim hit, proceed without DIAG.
+
+### KP #50 (DP) — fix #21 run 1: watchdog hang instead of instant panic (2026-08-01)
+
+- Run (`/tmp/late_free_run1.log`, `LATE_NEIGHBOUR_FREE=1`,
+  `MM_DRAIN_TRIGGERS=8`, no PARENT_PIPEBUF): fired on ATTEMPT 1
+  (`mm leaked=ffffff8a53740c00`, base `...740000`). Userspace log stops
+  right after `slide consumer sched idx=0` — the trigger entered the
+  kernel and never came back.
+- Dump `dumpstate_lastkmsg_50_..._DP.log.gz` (`s9280-port/lastkmsg_50.txt`):
+  NOT a walk panic. Kernel logs go silent for ~4 s (1240.8 -> 1244.7),
+  then `sched: RT throttling activated`, then the gh-watchdog bark/bite
+  (last pet 1234.4, cpu alive mask 01) — a system-wide stall, signature
+  "DP" (dog panic), not "KP". The three `binder:1681_3` Call traces
+  (581 s/1119 s/1133 s) are benign wifi rtnl-lock noise.
+- Read: the failure MODE changed from the KP #46-#49 instant
+  `+0x130 trylock` crash to a multi-second all-core stall, i.e. the walk
+  this time got PAST the trylock on waiter->lock. Most likely it walked
+  third-party content (reclaim still missing) far enough to corrupt a
+  hot lock in the erase/wake steps (the erase's second write hits
+  `page_struct(base)+8` when PARENT_PIPEBUF is unset, and ttwu on a
+  garbage task can spin on a real rq lock) -> scheduler deadlock ->
+  RT throttle -> watchdog. The changed signature is consistent with
+  fix #21 altering what occupies the target slab at trigger time, but
+  this dump alone cannot prove a reclaim hit/miss.
+- Ladder for the next runs: run 2 = fix #21 + `P0_ORACLE_PARENT_PIPEBUF=1`
+  (both erase writes land inside the oracle pipebuf page, so a completed
+  erase survives to userspace and flips the gate pipe: `changed=1` even
+  on a reclaim miss of the marker page). If run 2 returns `changed=1`,
+  the walk completed end-to-end under fix #21; then run 3 drops
+  PARENT_PIPEBUF to test the real gate (`hits=1`) before dropping DIAG.
+- Run 2 outcome (`/tmp/late_free_run2.log`, drains=16, 10 attempts):
+  ZERO fires — every attempt `gate hits=0 changed=0 result=0`
+  (not-triggered), no panic, no hang. Inconclusive for reclaim; the
+  ~1/10 fire rate just whiffed twice in a row (run 1's single fire hung,
+  run 2 had none). Run 3 repeats the same PARENT_PIPEBUF config with
+  `EXPLOIT_ATTEMPTS=20` to collect more fire samples; a fire that
+  returns `changed=1` proves the walk completed under fix #21, a fire
+  that hangs/panics again means the walked content is still not ours.
+
+### KP #51 — fix #21 run 3: silent fire, erase scribbles into a page's lru (2026-08-01)
+
+- Run 3 (`/tmp/late_free_run3.log`, PARENT_PIPEBUF=1, drains=16,
+  20 attempts): attempts 1-6 all `pselect ret=0`, `gate 0/0` (no
+  early-wake window). Attempt 7 stopped mid-prepare (right after the
+  `p0 profile` line) — device panicked at uptime 500 s.
+- Dump `dumpstate_lastkmsg_51_..._KP.log.gz` (`s9280-port/lastkmsg_51.txt`):
+  panic is in **kswapd0** (CPU 6), NOT in the walk:
+  `__list_del_entry_valid+0xbc` <- `free_pcppages_bulk` <-
+  `free_unref_page_commit` <- `free_unref_page_list` <-
+  `shrink_folio_list` <- `evict_folios` <- `shrink_node` <- `kswapd`.
+  A page's lru linkage was corrupted earlier; kswapd tripped over it
+  when attempt 7's pipe-oracle prep created memory pressure.
+- Read: one of attempts 1-6 fired SILENTLY (`ret=0` fires without the
+  early-wake window are exactly why the post-failure gate check exists),
+  the reclaim missed, and the walk this time SURVIVED past `+0x130
+  trylock` all the way to `+0x220 rb_erase` — whose two-pointer write
+  (`[target]=parent|color`, `[parent+8/0x10]=target`) took garbage
+  parent/target from the wrong page and scribbled kernel pointers into
+  live memory, one landing in some page's `lru` linkage. The gate pipe
+  read `changed=0` because a miss's erase uses the garbage waiter's
+  parent/target, not ours, so the pipebuf page is untouched.
+- Consolidated signal across fix #21 runs 1+3: pre-fix#21 fires died
+  INSTANTLY at `+0x130 trylock` (waiter->lock=0); fix #21 fires get
+  PAST it (DP hang / erase scribble). The target slab's content at
+  trigger time has changed — consistent with the empty slab now
+  reaching the buddy allocator (fix #21 working) and being claimed by
+  someone other than our skb frags (third-party content in the page).
+- Run 4 = fix #21 + `ANON_GRAB_TEST=1` (no PARENT_PIPEBUF): if order-0
+  anon faults can now win the buddy-released block, the walk consumes
+  `0x41` bytes and dies instantly at trylock with the unmistakable
+  `0x4141414141414141` signature (contained crash, no scribble). If so,
+  resurrect the shelved compact-4 KB-payload plan (task at base+0x000
+  already fits; move lock/waiter/marker from 0x4200/0x5200 into
+  0x980-0xFFF) and reclaim via mmap faults instead of skb frags.
+
+### Fix #22 — COMPACT_PAYLOAD: 4 KB walk image + anon-fault reclaim (2026-08-01)
+
+- Implemented env-gated (`COMPACT_PAYLOAD=1`) in `src/util.c` while run 4
+  collects its verdict, so a positive 0x41 signature can be acted on
+  immediately:
+  - `prepare_skb_payload` SLIDE branch: writes a compact 4 KB image —
+    fake_task at block+0x000 (pi fields reach +0x958), fake_lock at
+    +0x980 (wait_list +0x988/+0x990, owner +0x998), fake waiter at
+    +0x9C0-0xA18, gate marker at +0xA20 — replicated at every 0x1000
+    payload index >= 0x1000 (self-referential pointers per page), with
+    slot-0 parent/target identical to the legacy gate slot.
+  - `select_slide_payload_index`: compact mapping
+    (task=payload+0x1000, lock=+0x1980, w0=+0x19C0), slot 0 only.
+  - `prepare_kernel_page`: the ANON_GRAB_TEST mmap/fault block is shared;
+    with COMPACT_PAYLOAD each of the 256 grab pages is filled with the
+    4 KB image (memcpy from skb_buf idx 0x1000, pointers anchored at
+    base+0x000) instead of 0x41. Whichever anon fault splits the
+    buddy-released block installs the full walk image at base+0x000;
+    the skb frag sends stay as a same-layout fallback channel.
+- Verification plan: run 5 = `LATE_NEIGHBOUR_FREE=1 COMPACT_PAYLOAD=1
+  P0_ORACLE_GATE_DIAG=1` — a fire that reaches userspace with
+  `gate hits=1 changed=0` is the reclaim-hit milestone; then drop DIAG.
+
+### KP #52 — run 4 verdict: anon grab lost again; same +0x130 instant crash (2026-08-01)
+
+- Run 4 (`/tmp/late_free_run4.log`, fix #21 + `ANON_GRAB_TEST=1`, 7
+  attempts logged): attempts 1-6 no fire; attempt 7 fired and died
+  instantly. Dump `dumpstate_lastkmsg_52_..._KP.log.gz`
+  (`s9280-port/lastkmsg_52.txt`): pc `_raw_spin_trylock+0x1c`, lr
+  `rt_mutex_adjust_prio_chain+0x130`, fault addr 0, in our `id` child —
+  the byte-identical pre-fix#21 signature. `x27=x3=ffffff8a4631c200`
+  = attempt 7's fake_lock (legacy layout base+0x4200). Walked content:
+  `waiter->task=x19=ffffff88e0498000` (plausible task pointer,
+  `x26=x19+0x924` = its pi_lock), `waiter->lock=0`.
+- ZERO occurrences of `0x4141414141414141` in the dump: the 256-page
+  0x41 anon grab did NOT win the block even under fix #21 — neither did
+  the skb frags (no gate hit). Third-party content again.
+- Consolidated fix #21 fire samples (3 fires, 3 different signatures):
+  KP #50 (DP watchdog hang, walk got far), KP #51 (silent fire, erase
+  scribbled a page lru, kswapd died later), KP #52 (instant +0x130
+  crash, old signature). The buddy-race loser set is diverse — exactly
+  what "the block now leaves the mm_struct cache but lands somewhere
+  random" looks like. The remaining problem is no longer getting the
+  page OUT of the cache; it is winning it BACK deterministically.
+
+### Fix #23 — SKB_RECLAIM_SOCKS: multi-socket frag volume (2026-08-01)
+
+- Root cause of the losing race, quantified: one stream socket with
+  `SKB_SNDBUF=8 MB` accepts only ~250 64 KB sends before ENOBUFS
+  (log: `sends=251/256`) ≈ 500 order-3 frags. If the zone's order-3
+  free lists (plus coalesced higher-order blocks) are deeper than that
+  at trigger time, our spray never reaches the target block.
+- Fix (`src/util.c`, env `SKB_RECLAIM_SOCKS=N`, 1-8): create N-1 extra
+  socketpairs (each with its own SNDBUF, O_NONBLOCK) in
+  `prepare_kernel_page`; the reclaim send loop sprays
+  `SKB_RECLAIM_SENDS` messages on EVERY socket. With N=8: ~2000 sends ≈
+  ~4000 order-3 frags ≈ 128 MB queued — deep enough to exhaust the
+  order-3 free lists (and split down higher orders), so the target
+  block is consumed by OUR frags with high probability.
+  `close_reclaim_sockets()` cleans up the extra pairs.
+- Run 5 = `LATE_NEIGHBOUR_FREE=1 SKB_RECLAIM_SOCKS=8
+  P0_ORACLE_GATE_DIAG=1` (drains=16, 20 attempts): watch for the first
+  fire that reaches userspace with `gate hits=1 changed=0`; then drop
+  DIAG and run the real root chain. COMPACT_PAYLOAD stays on the shelf
+  unless run 5 shows the skb channel structurally cannot win.
+
+### KP #53 — run 5 verdict: deep spray still loses; the slab-growth-thief theory (2026-08-01)
+
+- Run 5 (`/tmp/fix23_run5.log`, fix #21+#23, 2008/2048 sends ≈ 4000
+  order-3 frags): 19 visible attempts, ZERO fires, then attempt 20 died
+  mid-prepare. Dump `dumpstate_lastkmsg_53_..._KP.log.gz`
+  (`s9280-port/lastkmsg_53.txt`): `__list_del_entry_valid+0xcc` <-
+  `move_freepages_block` <- `get_populated_pcp_list` <-
+  `get_page_from_freelist` <- `__alloc_pages` <- `alloc_fdtable` <-
+  `dup_fd` <- `copy_process` — in OUR `id` process during a fork, uptime
+  699 s. Same class as KP #51 (kswapd): a free-list linkage corrupted
+  by an earlier SILENT fire's erase (garbage parent/target two-pointer
+  write). Second consecutive run killed this way.
+- Tally under fix #21: 4 fires (KP #50 hang, #51 scribble, #52 instant
+  crash, #53 scribble), ALL reclaim misses — even with ~4000 frags
+  queued. Statistical volume cannot explain 4/4 losses IF the block
+  sat at the buddy head when our frags allocated.
+- New theory (slab-growth thief): the FIRST order-3 allocation after
+  `close(memfd_leak)` takes the block. Our own stream spray's per-send
+  skb struct allocations (kmalloc-2k, order-3 slabs) force slab growth
+  that claims the block into a KERNEL-content slab page before/at frag
+  allocation time; once a slab page, it never returns to buddy, so all
+  4000 frags miss. KP #52's walked content (plausible task pointer,
+  zero lock) fits a kernel-object slab page.
+- Corollary: whoever owns the first post-free order-3 allocation owns
+  the block; make that allocation a CONTROLLED-CONTENT slab growth.
+  msg_msg is unavailable (`# CONFIG_SYSVIPC is not set` on this kernel),
+  but unix DGRAM works: a ~4 KB datagram's data buffer is kmalloc'd
+  inline (kmalloc-8k, order-3) with content controlled from +0x22
+  (NET_SKB_PAD+NET_IP_ALIGN reserve). Every slab page our dgram spray
+  grows becomes a page full of walk images — thief becomes carrier.
+
+### Fix #26 — DGRAM_RECLAIM: controlled-content slab growth (2026-08-01)
+
+- `src/util.c`, env `DGRAM_RECLAIM=1`:
+  - The fix #22 compact 4 KB image builder now also runs for
+    DGRAM_RECLAIM (nothing below +0x40 is referenced, so the +0x22
+    dgram reserve is harmless); `select_slide_payload_index` maps slot 0
+    to the compact addresses (task=base+0x000, lock=+0x980, w0=+0x9C0).
+  - The fix #23 extra socketpairs become SOCK_DGRAM; the dgram payload
+    is the image shifted by +0x22 (`skb_buf+0x1000+0x22`, len 0xFDE) so
+    each kmalloc-8k object equals the image byte-for-byte.
+  - The dgram spray runs BEFORE the stream frag spray (first post-free
+    allocation must be ours), ~2000 dgrams/socket until ENOBUFS.
+- Run 6 = `LATE_NEIGHBOUR_FREE=1 DGRAM_RECLAIM=1 SKB_RECLAIM_SOCKS=8
+  P0_ORACLE_GATE_DIAG=1` (drains=16, 20 attempts): attempt 1 queued
+  **13902 dgrams** (~65 MB controlled objects ≈ 1700 order-3 slab
+  pages). A fire that returns `gate hits=1 changed=0` = reclaim hit;
+  then drop DIAG. If a fire crashes, check the dump for a +0x22 offset
+  error (x27 vs expected fake_lock) — Samsung/QCOM could reserve more
+  than 34 B in the skb head.
+
+### KP #54 — run 6 verdict: bogus KernelSnitch leak, pgd=0 (2026-08-01)
+
+Run 6 crashed on attempt 6 (`s9280-port/lastkmsg_54.txt`):
+
+- `Unable to handle kernel paging request at ffffff8ba9bd0980`,
+  pc `_raw_spin_trylock+0x1c`, FSC = level-1 translation fault,
+  **pgd=0** for the faulting address.
+- That attempt logged `mm leaked=ffffff8ba9bd2000
+  base=ffffff8ba9bd0000 object_index=8`, so the fault address is
+  exactly this attempt's fake_lock (base+0x980): x0=x3=x24=x27.
+- The walk was real: x19=x5=ffffff895b23ddc0 (walked task, NOT our
+  fake_task), x26=x19+0x924 (its pi_lock), x25=ffffffc0484e3c38 (a
+  genuine on-stack rt_mutex_waiter whose ->lock field the slide had
+  rewritten to base+0x980). So the slide + consumer walk chain fired
+  perfectly; only the leaked `base` was invalid.
+- Verdict: **KernelSnitch false-positive leak**, not a reclaim or
+  content problem. A freed linear-map page stays mapped (the physmap is
+  static), so pgd=0 proves the address was NEVER mapped — the leaked
+  value is a hash coincidence, not a real mm. Previous leaks all
+  clustered in ffffff8873..ffffff8a64; this one is >1 GB above every
+  address ever observed.
+- Mechanism (`src/kernelsnitch/kernelsnitch.h::__mm_leak`): the
+  bruteforce accepts the FIRST candidate in the 64 GB identity range
+  whose futex_hash matches all collisions, racing 8 threads. With
+  KSNITCH_COLLISIONS=4 (3 pair tests, 4096 buckets) the expected
+  false-candidate count across ~67M candidates is ~1e-3 — and a false
+  candidate lands uniformly anywhere in the 64 GB range, mostly in
+  unmapped gaps, hence pgd=0.
+
+### Fix #27 — KSNITCH_COLLISIONS 4 -> 6 (2026-08-01)
+
+- `src/common.h`: `KSNITCH_COLLISIONS` is now `#ifndef`-guarded;
+  `src/targets/e3q-S9280ZCS6DZF2/target.h` defines it to 6.
+- With 6 collisions (5 pair tests) the expected false-candidate count
+  drops to ~1e-10 — false leaks effectively impossible. Collision
+  finding needs 5 piled-up user futex addresses instead of 3
+  (expected ~24 candidates over the scan, so setup stays reliable).
+- Run 7 = same knobs as run 6, 20 attempts. Watch for: (a) zero
+  pgd=0-style bogus-base panics, (b) a fire with `gate hits=1
+  changed=0` = dgram reclaim hit -> drop DIAG and run the full chain.
+
+### KP #55 — run 7 verdict: leak genuine, walk passes trylock, content is the thief's (2026-08-01)
+
+Run 7 attempt 1 crashed (`s9280-port/lastkmsg_55.txt`) with a brand-new
+signature:
+
+- pc `rt_mutex_adjust_prio_chain+0x4a4` (FAR past the +0x130 trylock),
+  fault address `0001000000000040`, FSC level-0.
+- x24=x3=ffffff804af60980 = this attempt's fake_lock (base+0x980), and
+  the trylock on it SUCCEEDED — so the leaked page at
+  base=ffffff804af60000 is mapped and the leak was genuine.
+  **Fix #27 works.** (The low 1.2 GB-offset base vs the run-6 8-10 GB
+  cluster is just a fresh-boot RAM layout, not a leak regression.)
+- But x19 = 0x0001000000000000 (derefed at +0x40) and
+  x9 = 0x0000000100000002: small packed-int kernel-object content, NOT
+  our compact image. If our dgram image were at page+0x980 the rb
+  leftmost/owner chain would read base+0x9C0 or zeros, never these
+  values. The page was reclaimed by somebody else (fresh mm_struct /
+  similar small-int object).
+- Interpretation: the free-to-buddy -> first-allocator race is still
+  lost EVERY time, so the thief is systematic, not a random system
+  fork. Open hypotheses: (a) the target slab never leaves the
+  mm_struct cache on some attempts (fix #21 discard conditional on
+  nr_partial timing), (b) mm_struct cache growth steals the block,
+  (c) buddy merge buries our block inside a larger free block and
+  splits hand out other pieces first.
+
+### Fix #28 — SLABINFO_DIAG: three-point slab census (2026-08-01)
+
+- `src/util.c`, env `SLABINFO_DIAG=1`: parse /proc/slabinfo and log
+  `mm_struct` + `kmalloc-8k` active/total objects and slabs at three
+  points: `leak` (baseline), `post-free` (right after
+  close(memfd_leak)), `post-spray`.
+- Verdict key: `mm slabs` must DROP by 1 at post-free (discard
+  happened). If it doesn't -> fix #21's discard is unreliable and that
+  is the whole reclaim story. If it drops but `mm slabs` RISES at
+  post-spray -> the mm cache is the thief (fix: top the cache up with
+  held mm allocs before the free). If neither -> the thief is outside
+  these two caches (buddy-merge / other cache) and we re-theorize.
+
+### Walk disasm addendum: the +0x4a4 crash step (2026-08-01)
+
+From vmlinux.elf (`rt_mutex_adjust_prio_chain` base 0xffffffc00912271c):
+
+- +0x478 `ldr x8, [x24, #0x18]`: x8 = rt_mutex **owner** (rt_mutex_base
+  owner at lock+0x18 on this kernel). +0x484 `cmp x8, #1` + `b.ls
+  +0x820`: owner <= 1 exits toward the loop-tail path.
+- Owner > 1 falls through: +0x490 `and x19, x8, ~1` (next walked task =
+  owner & ~RT_MUTEX_HAS_WAITERS), +0x498 `add x0, x19, #0x40`, +0x4a4
+  `ldadd w8, w8, [x0]` = task->usage++ (get_task_struct). Then +0x4b4
+  `add x26, x19, #0x924` -> `_raw_spin_lock(task->pi_lock)`, +0x4c0
+  `ldr x22, [x24, #0x10]` (rb leftmost waiter) ...
+- KP #55 took the owner>1 branch because the thief page's [base+0x998]
+  read 0x0001000000000001. With OUR compact image [lock+0x18] =
+  SLIDE_LOCK_OWNER_VALUE = 1, the walk takes b.ls -> +0x820 instead —
+  the designed path. So the compact image geometry is still consistent
+  end-to-end; only the reclaim race stands between us and the erase
+  write primitive.
+
+### Run 8 — fix #28 verdict + first successful fire/write (2026-08-01)
+
+Run 8 (`SLABINFO_DIAG=1`, 20 attempts, NO device panic — all 20 attempts
+completed, attempts 2-20 died early on F_SETPIPE_SZ EPERM resource
+exhaustion from attempt 1's leaked state):
+
+- Attempt 1 slabinfo: `leak` mm=1760/1760 slabs=132 (cache full),
+  `post-free` slabs=118 (**14 emptied slabs reached the buddy allocator
+  synchronously** — fix #21 discard works), `post-spray` mm unchanged
+  (**mm cache is NOT the spray-window thief**), k8k slabs 626 -> 14278
+  (our dgram spray allocated ~13k order-3 blocks from the buddy pool).
+- Attempt 1 FIRED: pselect ret=2 with copyback values, and
+  **`p0 physical write status=0 ok=1` — first ever successful physical
+  write.** The walk/erase/write chain works end to end.
+- But the gate read pipe 194 (redirected to the target page) as
+  **all zeros** (q0-q7 = 0, `hits=0 changed=1`): the target page was
+  FREE/zeroed at walk time. Despite 13k order-3 spray allocations right
+  after the free, the block was NOT ours — it must reach the buddy pool
+  LATE (deferred discard / partial-list churn from the ~1000 prepare_ctx
+  child kills that run AFTER the spray), missing the one-shot spray.
+- Attempt slot 2 then ran with parent=0/target=0 (degenerate after
+  gate hits=0) and failed.
+
+### Fix #29 — RECLAIM_WAVES: spray waves across the whole window (2026-08-01)
+
+- `src/util.c`, env `RECLAIM_WAVES=N` (1-64, default 20),
+  `RECLAIM_WAVE_GAP_MS` (default 8): after the one-shot spray, a
+  detached pthread fires N waves of small reclaim bursts (fresh
+  socketpairs: 512 dgrams + 64 stream frags per wave) every 8 ms —
+  covering ~160 ms, the full arming window up to and past the consumer
+  walk (~110-170 ms). Whenever the block lands in the buddy pool, a
+  wave claims it with our image before the walk.
+- Wave thread pinned to exploit_core+2 to avoid disturbing the arming
+  timeline; wave sockets are thread-local and closed at thread exit.
+- Run 9 = run 8 knobs + `RECLAIM_WAVES=20`. Success = gate
+  `hits=1 changed=0` -> then drop DIAG for the full root chain.
+
+### Run 9 verdict + kernel-config findings (2026-08-01)
+
+- Run 9 attempt 1 fired + physical write ok=1 again, but the gate still
+  read the target page as all zeros (`hits=0 changed=1`), even with 20
+  spray waves covering ~160 ms. (Wave dgram sockets capped at ~28 sends
+  — default SO_SNDBUF — so waves were weaker than designed.)
+- Device config (re-pulled /proc/config.gz via exec-out — `adb shell
+  cat` CRLF-mangles binaries):
+  - `CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` — pages zeroed ON ALLOC, so a
+    zeroed gate page = freshly allocated/unwritten, NOT proof of
+    "free page" (INIT_ON_FREE is OFF).
+  - `CONFIG_SHUFFLE_PAGE_ALLOCATOR=y` — freed blocks land at RANDOM
+    free-list positions: the LIFO "our next alloc gets our block"
+    assumption is dead on this kernel.
+  - `CONFIG_SLAB_FREELIST_HARDENED=y` — a fully-freed slab page would
+    show obfuscated freepointers (non-zero), so the all-zero page is
+    not a retired slab either.
+- Remaining model: the block sits in a free-list our UNMOVABLE socket
+  sprays never draw from (pageblock migratetype MOVABLE/RECLAIMABLE,
+  and/or shuffle-buried), until the kernel splits it into order-0
+  MOVABLE pages that random system allocations consume.
+
+### Fix #30 — RECLAIM_WAVE_ANON: MOVABLE order-0 image waves (2026-08-01)
+
+- `src/util.c`, env `RECLAIM_WAVE_ANON=1`: each reclaim wave also mmaps
+  2 MB of anonymous pages and memcpys the compact 4 KB image into every
+  page (512 image pages/wave).  Anon faults are the highest-rate
+  controlled MOVABLE order-0 allocations available; once the block
+  splits, its pages enter the MOVABLE order-0 pool and our sustained
+  image-filled faults are the likeliest receivers.
+- Wave dgram sockets now get SO_SNDBUF=4 MB (run 9 capped at ~28
+  sends/wave).
+- Run 10 = run 9 knobs + `RECLAIM_WAVES=24 RECLAIM_WAVE_ANON=1`.
+  Success = gate `hits=1` (marker found anywhere in the page — the
+  marker scan is the definitive reclaim test; head-of-page zeros are
+  expected even on a hit because the image head is zero padding).
+
+### Run 10 verdict + KP #56: corruption lands in a vmemmap LRU (2026-08-01)
+
+- Run 10 attempt 1 was the earliest failure ever: the userspace log
+  stops right after the p0 profile line — before even
+  "pipe oracle prepared". No gate output at all.
+- KP #56 (`lastkmsg_56.txt`) shows the boot stayed up ~27 min; the only
+  fatal event is at uptime 1649 s (the earlier "Call trace" lines at
+  1555 s are benign `rtnl_lock` contention warnings from
+  binder/wpa_supplicant, unrelated):
+
+  ```
+  list_del corruption. prev->next should be fffffffe25014d88,
+      but was fffffffe22d92948. (prev=fffffffe2723fa08)
+  kernel BUG at lib/list_debug.c:61!
+  pc : __list_del_entry_valid+0xbc/0xd4
+  Call trace: __list_del_entry_valid <- evict_folios+0x107c
+      <- try_to_shrink_lruvec <- shrink_one <- shrink_node
+      <- balance_pgdat <- kswapd
+  ```
+
+- Address forensics (all `fffffffe...` = vmemmap / `struct page` land):
+  - Victim: `prev` = `ffffffe2723fa08` = `struct page` at
+    `ffffffe2723fa00`, field `lru.next` (+0x8). With
+    `VMEMMAP_START=0xfffffffe00000000` that is pfn `0x9c8fe8` → direct
+    map VA **`ffffff89c8fe8000` — exactly run 8's target page base**.
+  - Corrupting value `ffffffe22d92948` is *also* a vmemmap pointer:
+    `struct page` at `ffffffe22d92940`, its `lru` (+0x8) — i.e. a
+    folio-list link value (VA `ffffff88b64a5000`).
+- Conclusions:
+  1. The page at VA `ffffff89c8fe8000` is **real RAM**: in run 10's
+     boot it was a live folio sitting on an LRU that kswapd tried to
+     evict. The high VA/PA region (pfn `0x9c8fe8`, PA ≥ 0x9c8fe8000) is
+     genuine DDR — the device has high/sparse banks, and the
+     VMEMMAP/direct-map formulas are confirmed by in-kernel evidence
+     (not just by the walk not faulting). `/proc/device-tree/memory/reg`
+     is root-only (320 B ≈ 20 bank entries) so the bank map cannot be
+     dumped as shell; this LRU evidence substitutes for it.
+  2. Run 10's corruption wrote a *folio-list pointer* into a *struct
+     page's lru field* — a vmemmap→vmemmap scribble. Two candidate
+     sources, both from our machinery after a missed reclaim: the erase
+     physical write with a wrong `target` (gate pipe pipebuf address
+     wrong/stale), or the off-rails rt_mutex walk performing
+     plist/rb-tree link writes with values read from garbage pages.
+     Either way it is the same delayed-blast pattern as KP #51: silent
+     scratch at fire time, fatal only when an unsuspecting kernel
+     thread (here kswapd) later walks the damaged list.
+- Practical impact: after a missed reclaim the exploit must expect the
+  walk/erase to scribble; runs are one-shot and every fire that misses
+  risks a dirty kernel. This makes the gate *tenant identification*
+  (what actually landed in the target page) the critical datapoint.
+
+### Fix #31 — gate tenant identification dump (2026-08-01)
+
+- `src/pipe.c`, `verify_p0_pipe_oracle_gate()`: when the gate reads the
+  target page back and the marker scan misses (`changed` branch),
+  additionally dump the non-zero byte count of the whole 4 KB page plus
+  the qwords at +0x40 / +0x980 / +0x9C0 / +0xA20 (image head, waiter
+  slot, marker lead-in). Verdict key for run 11:
+  - non-zero count == 0 → page never written: block sat idle in
+    buddy/PCP or was allocated but never filled → reclaim channel still
+    too narrow/slow.
+  - +0x980/+0xA20 hold image values (waiter address / "RMG-P0-O…") →
+    reclaim **hit** and only the marker placement is wrong → fix marker
+    offset or drop DIAG and go for the full chain.
+  - non-zero but foreign values → identify the thief from the content.
+
+### Run 11 — fix #31 verdict: full prep chain, panic at the trigger instant (2026-08-01)
+
+- First run with the whole stack (fix #21 + #26 + #28 + #29 + #30 + #31)
+  on a fresh boot. Every preparation stage passed cleanly:
+  - Leak stable: mm base `ffffff88f45e8000` (same region as run 8).
+  - Slab discard effective: post-free mm objects 1856→1834 (target
+    slab emptied, `LATE_NEIGHBOUR_FREE` working).
+  - Spray volume strong: 13902 dgram sends + 14153 sk_buff sends;
+    k8k slabs 546 → 7443 (ample buddy uptake).
+  - Physical write channel computed: `pipebuf=ffffff89da8d0000`,
+    `target=...0800`, `parent=fffffffe23d17a00`.
+- The log (unbuffered) ends at `slide consumer sched idx=0
+  t=111437` — 60 ms after pselect arming (t=50893), i.e. exactly at the
+  trigger instant. adb exited 255: the device panicked right there and
+  the fix #31 gate tenant dump was never emitted. Trigger-side crash,
+  not a preparation failure.
+- KP #57 dump pull pending; its crash signature (trylock +0x12c vs
+  get_task_struct +0x4a4 vs another vmemmap scribble) tells which
+  tenant the walk actually found in the target page this time.
+
 ## Files Modified
 
 All S9280-related changes are uncommitted working-tree changes (the
@@ -646,11 +1331,11 @@ checkout is CRLF, so plain `git diff` shows whole-file noise — use
 
 | File | Changes |
 |------|---------|
-| `src/targets/e3q-S9280ZCS6DZF2/` | New target (untracked): header, fingerprint; `P0_ORACLE_GATE_PAGE_OFF` 0x0e80 -> 0x1e80 (fix #15) |
-| `src/common.h` | `MM_STRUCT_SLAB_SZ`; runtime knobs (`SKB_RECLAIM_SENDS`, `MM_DRAIN_TRIGGERS`, `KSNITCH_DEFAULT_PROFILE`); `exploit_core()` declaration |
+| `src/targets/e3q-S9280ZCS6DZF2/` | New target (untracked): header, fingerprint; `P0_ORACLE_GATE_PAGE_OFF` 0x0e80 -> 0x1e80 (fix #15); `KSNITCH_COLLISIONS` 4 -> 6 (fix #27) |
+| `src/common.h` | `MM_STRUCT_SLAB_SZ`; runtime knobs (`SKB_RECLAIM_SENDS`, `MM_DRAIN_TRIGGERS`, `KSNITCH_DEFAULT_PROFILE`); `exploit_core()` declaration; `KSNITCH_COLLISIONS` now `#ifndef`-guarded (fix #27) |
 | `src/fops.c` | Shift-aware `prepare_pselect_fdsets`, pipe fill before pselect, consumer completion wait |
-| `src/util.c` | KernelSnitch bruteforce stride `MM_STRUCT_SZ` -> `MM_STRUCT_SLAB_SZ` (fix #9); `EXPLOIT_CORE`/`exploit_core()`; cleanup before sends; knob plumbing; `SKB_SNDBUF` env override |
-| `src/pipe.c` | `objs_per_slab` uses `MM_STRUCT_SLAB_SZ`; pipe page child lifecycle aligned with `prepare_kernel_page` (fix #10); gate diagnostic continues past tee/read failures with `tee_failures` counter (fix #13) |
+| `src/util.c` | KernelSnitch bruteforce stride `MM_STRUCT_SZ` -> `MM_STRUCT_SLAB_SZ` (fix #9); `EXPLOIT_CORE`/`exploit_core()`; cleanup before sends; knob plumbing; `SKB_SNDBUF` env override; `P0_ORACLE_PARENT_PIPEBUF` reclaim-vs-walk diagnostic knob; fix #19 reclaim ordering (neighbours freed before drain pressure; supersedes reverted fix #18); fix #21 `LATE_NEIGHBOUR_FREE` (drains first, `close(memfd_leak)` last so the empty target slab is discarded to the buddy allocator); fix #22 `COMPACT_PAYLOAD` (4 KB walk image + anon-fault reclaim, shelved); fix #23 `SKB_RECLAIM_SOCKS` (up to 8 socketpairs multiplying the queued frag volume); fix #26 `DGRAM_RECLAIM` (content-controlled dgram data kmalloc spray); fix #28 `SLABINFO_DIAG` (three-point slab census); fix #29 `RECLAIM_WAVES` (periodic reclaim bursts across the arming window); fix #30 `RECLAIM_WAVE_ANON` (per-wave 2 MB anon image faults + 4 MB wave SO_SNDBUF) |
+| `src/pipe.c` | `objs_per_slab` uses `MM_STRUCT_SLAB_SZ`; pipe page child lifecycle aligned with `prepare_kernel_page` (fix #10); gate diagnostic continues past tee/read failures with `tee_failures` counter (fix #13); fix #31 gate tenant identification dump (non-zero byte count + qwords at +0x40/+0x980/+0x9C0/+0xA20 on marker miss) |
 | `src/main.c` | `exploit_core()` call sites; consumer diagnostic logging |
 | `src/slide_app.c` | `P0_ORACLE_GATE_DIAG` gate-verify on trigger failure; `cmp_requeue_pi` logging; `SLIDE_CONSUMER_BURST`/`SLIDE_CONSUMER_SPACING_USEC`; `SLIDE_ENTER_DELAY_USEC`/`PSELECT_DELAY_USEC` delay forcing; pselect copy-back dump on fires (fix #14); `SLIDE_OWNER_UNLOCK` owner-unlock trigger (fix #16) |
 

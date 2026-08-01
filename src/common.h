@@ -66,7 +66,9 @@
 #endif
 #define MM_PARTIALS 5
 #define CORE 0
+#ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
+#endif
 
 #define ORDER3_SIZE (PAGE_SIZE << MM_ORDER)
 #define PIPE_CANDIDATE_PAGES 8

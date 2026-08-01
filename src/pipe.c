@@ -1023,6 +1023,29 @@ int verify_p0_pipe_oracle_gate(void) {
               (unsigned long long)words[5],
               (unsigned long long)words[6],
               (unsigned long long)words[7]);
+      /* Tenant identification (fix #31): an all-zero page means "freshly
+       * allocated, never written" (INIT_ON_ALLOC), so dump the walk-image
+       * key offsets and a non-zero histogram to tell our image (lock at
+       * +0x980, waiter at +0x9c0, marker at +0xa20) from foreign content
+       * or a never-written page. */
+      size_t nonzero = 0;
+      for (size_t i = 0; i < PAGE_SIZE; i++) {
+        if (page[i]) {
+          nonzero++;
+        }
+      }
+      uint64_t probe[4];
+      memcpy(probe + 0, page + 0x40, 8);
+      memcpy(probe + 1, page + 0x980, 8);
+      memcpy(probe + 2, page + 0x9c0, 8);
+      memcpy(probe + 3, page + 0xa20, 8);
+      pr_info("p0 gate changed pipe=%zu nonzero=%zu u40=%016llx "
+              "u980=%016llx u9c0=%016llx ua20=%016llx\n",
+              pipe_index, nonzero,
+              (unsigned long long)probe[0],
+              (unsigned long long)probe[1],
+              (unsigned long long)probe[2],
+              (unsigned long long)probe[3]);
     }
   }
 
