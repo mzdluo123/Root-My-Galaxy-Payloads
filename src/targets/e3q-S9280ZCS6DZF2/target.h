@@ -18,6 +18,7 @@
 #define P0_PHYS_OFFSET 0x80000000ULL
 #define P0_KERNEL_PHYS_LOAD 0x80080000ULL
 #define SKB_DATA_DELTA (-0x1000LL)
+#define P0_DATA_NO_SLIDE 1
 
 /* Verified from target BTF: sizeof(struct mm_struct) = 0x3c0 */
 #define MM_STRUCT_SZ 0x3c0

@@ -200,6 +200,16 @@
   P0_DATA_ALIAS_CONST(SLIDE_ROOT_TASK_GROUP_IMAGE)
 #define SLIDE_SYSCTL_BOOTID P0_DATA_ALIAS_CONST(SLIDE_SYSCTL_BOOTID_IMAGE)
 
+#ifndef FOPS_RECLAIM_PROBE_OFF
+#define FOPS_RECLAIM_PROBE_OFF 0x1400
+#endif
+#ifndef FOPS_RECLAIM_PROBE_MAGIC
+#define FOPS_RECLAIM_PROBE_MAGIC 0x43499001ULL
+#endif
+#ifndef FOPS_WRITE_LOCK_OFF
+#define FOPS_WRITE_LOCK_OFF 0x1280
+#endif
+
 #define PAGE_PAYLOAD_FOPS 0
 #define PAGE_PAYLOAD_SLIDE 1
 
@@ -329,6 +339,8 @@ extern ssize_t slide_bootid_restore_ret;
 extern uintptr_t slide_p0_offset;
 extern uintptr_t slide_oracle_parent;
 extern uintptr_t slide_oracle_target;
+extern uintptr_t slide_oracle_page_base;
+extern uintptr_t slide_oracle_root_cred;
 extern uintptr_t slide_oracle_child;
 extern uintptr_t p0_gate_page_struct;
 extern uintptr_t p0_probe_page_struct;

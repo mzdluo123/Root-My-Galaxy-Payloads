@@ -2048,11 +2048,121 @@ rb_left(Q)=0 writable targets (INIT_TASK).  Remaining to root:
     that at task->cred requires task resolution (percpu current_task), which
     itself needs a general read.  So general-read is the next unlock.
 
+### Hardware session 2026-08-16/17 — FOPS hijack fire, still uid 2000
+
+Device on ADB: serial `R5CX11J755L`, `product=e3qzcx`, fingerprint
+`samsung/e3qzcx/e3q:16/BP4A.251205.006/S9280ZCS6DZF2:user/release-keys`.
+Shell remains `uid=2000` / `u:r:shell:s0`. No uid 0 this session.
+
+**Tracefs KASLR is reliable.** `/data/local/tmp/run-slide.sh` (root-umh,
+slide-only) returns a fresh `p0_offset` every boot. Observed this session:
+`0x10000`, `0x160000`, `0x190000`, `0xf0000`. Force that value with
+`SLIDE_P0_OFFSET` on the app payload. Do not reuse a previous boot's slide.
+
+**P0 aliases are not mapped.** Physical writes through `0xffffff8000xxxxxx`
+(P0 + slide) fault. RWC:83
+`PC:filp_close+0x38 LR:<slide+unmapped-P0>`. All walk VAs must be kimage
+`0xffffffc0...` via `data_addr()` / `kaslr_image_addr()`. `INIT_TASK` /
+`ASHMEM_MISC_FOPS` / waiter `pi_task` follow that rule.
+
+**DIRECT_FOPS_WRITE geometry (current binary).**
+
+| Slot | VA |
+| --- | --- |
+| `q` / parent | `kaslr_image_addr(ASHMEM_MISC_FOPS) - 8` |
+| child | `0` (one-child `rb_erase`) |
+| target V | `slide_bank_payload_base + 0x1000` (fake `file_operations`) |
+| lock | `payload + 0x1180` |
+| waiter | `payload + 0x11c0` |
+
+`DIRECT_FOPS_OWNER_CLEAR` keeps the same lock/table page and sets
+`target=0` so a second fire zeros `misc->fops` owner before `fops_get`.
+
+**Farthest live result: hijack + open, ioctl ENOTTY.**
+
+- Early fire (owner uncleared): `triggered=1`, `/dev/ashmem` open =
+  `ENODEV` (`fops_get` on leftover `owner`).
+- Later fires (attempts 6 and 10, slide `0x10000`, 0x1000 layout):
+  `triggered=1`, owner-clear, ashmem `open` succeeded, `ASHMEM_SET_NAME`
+  returned `ENOTTY` (`errno=25`). `configfs_bin_write_iter` was not
+  reached. CFI / cred write never ran.
+- Interpretation: the walk can complete when the lock slot looks unlocked
+  (mm_struct page-0 is often zeros). `misc->fops` is then pointed at that
+  page, not necessarily our skb image. `unlocked_ioctl` is leftover mm
+  data, so `ashmem_ioctl` never runs.
+
+**Layout / knob casualties (do not repeat).**
+
+| Experiment | Panic |
+| --- | --- |
+| FOPS write with P0+slide VAs | RWC:83 `filp_close` / unmapped P0 |
+| `LATE_NEIGHBOUR_FREE` + same-page lock | RWC:89 `rt_mutex_adjust_prio_chain+0x918` BUG_ON leftover |
+| Table/lock at skb `0x5000`/`0x5180` (the old 0x5200 page) | RWC:90 `_raw_spin_trylock` — that page more often holds a live lock |
+| Exploit inside ~2 min of reboot | frequent `trylock` / leftover-waiter panics |
+
+Stay on `0x1000`/`0x1180`. Wait until uptime ≥ 4 min and load has dropped
+before launching. Do not enable `LATE_NEIGHBOUR_FREE` on this path.
+
+**Fire rate is the current bottleneck.** Quiet boot 2026-08-17 00:53
+(slide `0xf0000`): first 24/24 `pselect ret=0`, zero fires, device stayed
+up. Immediate second batch on the same boot: attempts 1–15 also miss.
+Supervisor `pid=22025` then leaked a KernelSnitch waiter storm (`id`
+children stuck in `sigsuspend`); load peaked at 157. Killed the tree at
+01:12. Do not overlap two 24-batches. Wait for load < 8 before the next
+launch.
+
+**DIRECT_FOPS_PROBE — RWC 92, do not rerun as-is.** Built and pushed
+01:16. Attempt 1: `parent=ffffff80024e62e0` (`bootid_data+slide-0x10`),
+`lock=page+0x1180`, `pselect ret=0` in 250 ms, `triggered=0`. Attempt 2
+entered `rb_erase` and panicked before flush.
+
+| Field | Value |
+| --- | --- |
+| Time | 2026-08-17 01:17:48 +0800 |
+| RWC | 92 |
+| PC | `rb_erase+0x94/0x2f8` |
+| LR | `rt_mutex_adjust_prio_chain+0x224/0x91c` |
+
+`+0x94` is the two-child successor path. Probe `Q=page+0x1400` is a
+clean leaf only on a reclaim hit. On a leftover `mm_struct` page that
+offset is mid-object pointers, so the first fire panics. Burst + 250 ms
+timeout did raise walk probability (fire on attempt 2).
+
+**Next resume (not done this stop).** Point probe `Q` at `fake_fops`
+(`page+0x1000`, already a leaf: `llseek`/`read` = 0). Store
+`FOPS_RECLAIM_PROBE_MAGIC` in `owner`. Leftover mm page-0 is usually
+zeros → walk survives, `boot_id != MAGIC`, skip `misc->fops`. Hit →
+MAGIC → second walk writes `misc->fops` → owner-clear. Do not launch
+`DIRECT_FOPS_PROBE` again until that change is in the `.so`.
+
+**Root status 2026-08-17 01:20 (stopping here).**
+
+- Device: `R5CX11J755L` / `e3qzcx` / `S9280ZCS6DZF2`, ADB up, `uid=2000`.
+- KASLR leak: done (tracefs). Last slide before RWC 92: `0xf0000`.
+- Child-mode arb-read of `rb_left(Q)=0` targets: previously proven.
+- `rb_erase` write of `misc->fops`: fire-proven.
+- `fops_get` / ashmem `open`: proven after owner-clear.
+- `ASHMEM_SET_NAME` ENOTTY: table reclaim miss.
+- `DIRECT_FOPS_PROBE` as committed: **unsafe** (RWC 92). Fix above
+  before the next device run.
+- KernelSU late-load: not reached.
+
+**Page layout in this tree (unsafe probe Q still at `0x1400`).**
+
+| Offset | Role |
+| --- | --- |
+| `0x1000` | fake `file_operations` |
+| `0x1180` / `0x11c0` | probe lock + waiter |
+| `0x1280` / `0x12c0` | FOPS-write lock + waiter |
+| `0x1400` | leaf `FOPS_RECLAIM_PROBE_MAGIC=0x43499001` (do not use as Q) |
+
+
+
 ## Files Modified
 
-All S9280-related changes are uncommitted working-tree changes (the
-checkout is CRLF, so plain `git diff` shows whole-file noise — use
-`git diff -w`). Do not commit yet.
+All S9280 session changes through 2026-08-17 01:20 are in this commit
+(working tree was CRLF; use `git diff -w` against older revs).
+
 
 | File | Changes |
 |------|---------|

