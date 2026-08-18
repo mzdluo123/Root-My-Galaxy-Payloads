@@ -2720,6 +2720,102 @@ the boot-killer.
    `adb forward tcp:5559 tcp:5559` for the root shell, then read the
    CTF flag.
 
+### External research 2026-08-17 evening — same-version devices & reference exploit
+
+**CVE identity.**  CVE-2026-43499 = "GhostLock" (Nebula/VEGA, kernelCTF
+$92,337): `remove_waiter()` in `rt_mutex_start_proxy_lock()`'s -EDEADLK
+rollback takes `current->pi_lock` and clears `current->pi_blocked_on`
+instead of `waiter->task`'s — the sleeping requeue waiter keeps a
+dangling `pi_blocked_on` after its stack waiter was dequeued.  Fix:
+upstream `3bfdc63936dd` ("use waiter::task instead of current").
+Reference exploit reliability: **97% on x86 LTS 6.12** (Nebula).
+
+**Reference choreography** (pragma-core writeup + `ghostlock-main.c`):
+3-futex cycle (waiter holds `f_pi_chain`, blocks in
+`FUTEX_WAIT_REQUEUE_PI(f_wait→f_pi_target)`; owner holds `f_pi_target`,
+blocks on `f_pi_chain`; main fires `FUTEX_CMP_REQUEUE_PI` → EDEADLK).
+Waiter wakes with dangling `pi_blocked_on`, reclaims its own freed
+stack frame with a big-stack syscall (reference uses
+`prctl(PR_SET_MM_MAP)` + memfd PUNCH_HOLE; we use pselect stack_fds),
+then the consumer's `sched_setattr` walk does the rb_erase write.
+Reference claims **no time pressure after staging** — the reclaimed
+bytes persist in *dead* stack memory (nothing zeroes it) and later
+syscalls stay shallow, so shots land at leisure.  Our design shoots
+during the *live* pselect frame, which is where our window race comes
+from.
+
+**Device config facts** (this boot, read-only):
+`CONFIG_RANDOMIZE_KSTACK_OFFSET=y` but `_DEFAULT` **off** → our threads
+get deterministic kstack placement; stack-lottery theories excluded.
+`CONFIG_INIT_ON_ALLOC_DEFAULT_ON=y` → reclaimed pages arrive zeroed;
+a reclaim miss on a *fresh* page reads lock=0 → trylock succeeds →
+empty tree → silent no-fire (safe).  Panics require a *foreign-tenant*
+page (task/slab garbage), not a zeroed one.
+
+**Same-version devices.**
+- `SM-S928U/U1` (e3q, same DZF2 generation, the only official sibling
+  profile): as of 2026-07-21 stuck at exactly our old blocker —
+  pselect write windows confirmed but zero oracle hits ("allocator-
+  placement problem").  No public progress since; upstream
+  `origin/main` has no commits newer than our fork base.
+- `SM-S9370` (S25 Edge, 6.6.98-android15): **full root 2026-08-07**
+  with the standard chain — fops trigger `triggered=1` on attempt 4,
+  cfi write/read, pipe physrw, umh root.  On that kernel the reclaim
+  *lands*; nothing exotic was needed.
+- Reddit S928B/S928W "one-click root" claims: no matching official
+  profile in `support/targets-v3.json` (feed lists only `SM-S928U` for
+  S24 Ultra); not usable evidence.
+- No public SM-S9280 success report exists.  Our campaign (arb-read,
+  arb-write, selinux write ×2, perf task scan) is ahead of the public
+  state for this device family.
+
+**Reinterpretation of the ~1/10 fire rate.**  The `calls=1` windows
+show `sched_setattr` blocking ~190 ms *in-kernel* before returning 0 —
+that is the walk engaged (residue present) and retry-looping on a
+garbage/locked `fake_lock` word, exiting when the waiter-side state
+dies.  So the residue survives far more often than 1/10; **the ~1/10
+is the reclaim-page hit rate** (page at `fake_lock` being ours vs
+zeroed vs foreign).  Consequences:
+- Multi-waiter threading would NOT help (all waiters share one reclaim
+  page per attempt).
+- The levers that matter: (a) raise reclaim hit rate, (b) make foreign
+  misses non-fatal (250 ms window already killed the dead-frame class;
+  foreign-rb-garbage derefs remain), (c) more windows per boot =
+  automation across panics/reboots.
+- A cheap discriminating test for later: waiter spins in userspace
+  after pselect return (no syscalls), consumer fires at +300/+500/
+  +1000 ms.  Late fires ⇒ dead-stack persistence works on arm64 too
+  and the window race can be dropped entirely.
+
+### Autonomous grind — `s9280-port/auto-grind.sh` (2026-08-18 00:47+)
+
+Driver loops: watch device (adb only post-unlock) → settle
+(uptime≥240, load<8) → slide leak → patch+push run scripts → selinux
+batches (≤16) until Permissive → cred-self batches (≤16) until ROOT →
+never voluntarily reboots (each reboot costs a manual unlock); keeps
+re-grinding a boot while it produces fires.  Runs under `hub` as
+process `grind`; per-run logs in `s9280-port/grind-<ts>/`.  Stop via
+`touch s9280-port/STOP-GRIND`.  WSL note: hub's bash is WSL — the
+driver falls back to the WinGet `adb.exe` under /mnt/c (hub `env` is
+not propagated).  Bug fixed live: `root_proven` sentinel made it
+always-true (false ROOT after cycle 1).
+
+**Grind cycle 1 (boot uptime 6 h, slide 0x1c0000).**
+- selinux batch 1: **3 completing fires in 6 attempts**
+  (`calls=5 ret=6 write ok=1`) → `enforce=0` after batch 1.  Hot boot.
+- cred-self batch 1 attempt 1: **perf winner VALIDATED** —
+  `cred-self validate task=ffffff89520a8000 pid=13407
+  hi=0000345f0000345f ok=1 valid=1` (pid|tgid at task+0x630 both ==
+  getpid).  `perf_find_task_self` is proven; **NOVALIDATE enabled
+  permanently** in `run-credself.sh` (all windows now go to the write).
+- 25 s into the batch: **RWC 126 `rb_erase+0x8c`** — the cred write
+  fire's first window reclaim-missed to a foreign-tenant page; the
+  erase ran with garbage `tree_left=V` and the collateral `[V+0]`
+  store faulted.  Same class as KP #75/#78 (foreign-content erase),
+  not a cred-self logic bug: the validated task VA was correct.
+- Per-boot requirement is now 2 completing fires (selinux + cred).
+
+
 
 
 
